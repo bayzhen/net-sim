@@ -86,6 +86,7 @@ def view_rerun(
     bind: str = "0.0.0.0:9090",
     save_path: str = None,
     spawn: bool = False,
+    public_host: str = None,
 ) -> None:
     try:
         import rerun as rr  # type: ignore
@@ -98,11 +99,16 @@ def view_rerun(
     web_port = None
     grpc_port = None
     if serve:
-        host, _, port_str = bind.partition(":")
+        _, _, port_str = bind.partition(":")
         web_port = int(port_str) if port_str else 9090
         grpc_port = web_port + 1
-        # serve_grpc returns the URI that serve_web_viewer needs to connect to.
+        # serve_grpc listens on 0.0.0.0:grpc_port but returns a URI hard-coded
+        # to 127.0.0.1, which breaks remote browsers (the page will try to
+        # connect to 127.0.0.1 on the *user's* machine). When --public-host is
+        # given, override the URI so the page connects to a reachable host.
         server_uri = rr.serve_grpc(grpc_port=grpc_port)
+        if public_host:
+            server_uri = f"rerun+http://{public_host}:{grpc_port}/proxy"
         rr.serve_web_viewer(
             web_port=web_port, open_browser=False, connect_to=server_uri
         )

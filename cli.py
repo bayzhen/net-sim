@@ -162,6 +162,7 @@ def cmd_view_rerun(args: argparse.Namespace) -> int:
         bind=args.bind,
         save_path=args.save,
         spawn=args.spawn,
+        public_host=args.public_host,
     )
     return 0
 
@@ -192,6 +193,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_view.add_argument("--serve", action="store_true", help="start rerun web server")
     p_view.add_argument("--spawn", action="store_true", help="open local rerun GUI")
     p_view.add_argument("--bind", default="0.0.0.0:9090", help="host:port for --serve")
+    p_view.add_argument(
+        "--public-host",
+        dest="public_host",
+        default=None,
+        help="host the browser will use to reach the gRPC port "
+        "(default: 127.0.0.1; set to your tunnel/public hostname so the page "
+        "can reach the gRPC backend)",
+    )
     p_view.add_argument("--save", help="path to write .rrd")
     p_view.set_defaults(func=cmd_view_rerun)
     return parser
