@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Generated datasets & rerun recordings
+Agent/Temp/
+*.rrd
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Local config
+.env
+
+# Personal launcher (not part of the project)
+claude.sh
