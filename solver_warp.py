@@ -479,6 +479,7 @@ def k_apply_segment_response(
     panel_restitution: wp.array(dtype=float),
     panel_friction: wp.array(dtype=float),
     impulse_clamp: float,
+    impulse_speed_threshold: float,
     best_toi: wp.array(dtype=float),
     best_idx: wp.array(dtype=int),
     sub_dt: float,
@@ -538,10 +539,11 @@ def k_apply_segment_response(
     new_v = reflect_velocity(v_before, n, e, f)
     ball_vel[b] = new_v
 
-    # impulse injection to two endpoints
+    # impulse injection to two endpoints — skip if ball was barely moving
+    # (sustained low-speed contact would otherwise pump energy every substep)
     dv_ball = new_v - v_before
     impulse_n = ball_mass * wp.dot(dv_ball, n)  # >0 means ball is pushed in +n
-    if impulse_n > 0.0:
+    if impulse_n > 0.0 and vlen >= impulse_speed_threshold:
         w0 = float(1.0 - t)
         w1 = float(t)
         i0 = c_i0[c_idx]
@@ -1348,6 +1350,7 @@ class XpbdWarpSolver:
                         self.panel_restitution_wp,
                         self.panel_friction_wp,
                         self.params.rope.impulse_clamp,
+                        self.params.rope.impulse_speed_threshold,
                         seg_best_toi_wp,
                         seg_best_idx_wp,
                         sub_dt,

@@ -163,6 +163,18 @@ def _raw_doc(
             }
             for g in topology.goalpost_segments
         ],
+        "support_stays": [
+            {
+                "index": s.index,
+                "name": s.name,
+                "corner_particle": s.corner_particle,
+                "stake_particle": s.stake_particle,
+                "constraint": s.constraint,
+                "radius": s.radius,
+            }
+            for s in topology.support_stays
+        ],
+        "stake_particle_indices": list(topology.stake_particle_indices),
     }
     return {
         "metadata": {

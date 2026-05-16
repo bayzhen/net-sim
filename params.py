@@ -40,6 +40,11 @@ class RopeParams:
     panel_restitution_side: float = 0.20
     panel_friction_back_tangent: float = 0.80
     impulse_clamp: float = 6.0
+    # Skip swept-impulse injection into the rope when the ball is barely
+    # moving — repeated low-speed contact (e.g. ball rolling against the net
+    # bottom after a ground bounce) otherwise pumps energy every substep and
+    # makes the net oscillate forever.
+    impulse_speed_threshold: float = 1.0
 
     def effective_collision_radius(self) -> float:
         return self.collision_radius if self.collision_radius > 0 else self.radius
@@ -57,6 +62,19 @@ class ShapeParams:
     top_sag: float = 0.16
     side_slope: float = 0.15
     back_slope: float = 0.05
+    # Pocket: middle of back panel bulges further into -z direction, like a
+    # real soccer-goal net pulled out by support stays. Peak at panel centre,
+    # zero at all four edges (so seams with side/top/floor stay welded).
+    back_pocket_depth: float = 0.30
+    # Support-stay ropes lift the back-top corners of the net UP-AND-BACK
+    # toward an elevated anchor point (like the eyelet on a real soccer
+    # goal's upper rear bar). The net corner is *not* anchored to its rest
+    # position — it hangs from the stay; the anchor at the other end is what
+    # holds the whole back of the net up.
+    stay_count: int = 2  # 0 / 2 / 4
+    stay_anchor_offset_x: float = 0.3   # outward from ±W/2
+    stay_anchor_offset_y: float = 0.6   # above corner.y (= H by default)
+    stay_anchor_offset_z: float = 0.4   # behind goal-back (= -depth)
 
 
 @dataclass

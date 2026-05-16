@@ -85,6 +85,7 @@
 | `panel_restitution_side` | 0.20 | LEFT/RIGHT 面 |
 | `panel_friction_back_tangent` | 0.80 | BACK 面切向摩擦（运行时 `parallel *= 0.2` 即 friction 0.8） |
 | `impulse_clamp` | 6.0 | 单次 swept 命中时注入到绳粒子的最大速度增量（m/s），防止近锚段被打飞 |
+| `impulse_speed_threshold` | 1.0 | **v2 新增**：球速 < 此值时 swept 不再注能给网，杜绝持续低速接触的能量泵入循环（球落地反弹顶网那种） |
 
 ### 2.4 `AnchorParams`
 
@@ -100,7 +101,12 @@
 |---|---|---|
 | `top_sag` | 0.16 | 顶网/后网下垂量（粒子初始 y 偏移） |
 | `side_slope` | 0.15 | 侧网外扩斜度（远离 z=0 时 x 略外开） |
-| `back_slope` | 0.05 | 后网底部 z 略后倾 |
+| `back_slope` | 0.05 | 后网底部 z 略后倾（沿 u 方向用 `4·u/nx·(1-u/nx)` 调制，边缘归零保持 dedup 焊接） |
+| `back_pocket_depth` | 0.30 | **v2 新增**：后网中心向 -z 方向兜状鼓包，四边为零 |
+| `stay_count` | 2 | **v2 新增**：物理支撑绳数量（0 / 2 / 4） |
+| `stay_anchor_offset_x` | 0.3 | **v2 新增**：stay 远端锚点相对后上角外侧偏移 |
+| `stay_anchor_offset_y` | 0.6 | **v2 新增**：stay 远端锚点相对后上角上方偏移 |
+| `stay_anchor_offset_z` | 0.4 | **v2 新增**：stay 远端锚点相对后上角后方偏移 |
 
 ### 2.6 `SolverParams`
 
@@ -201,13 +207,17 @@ class GoalpostSegment:
 
 ### 3.2 锚定边缘规则（`generate_topology`）
 
+**v2 现行实现**（与原 v1 spec 有差异，详见 §15 v2 changelog）：
+
 | Panel | 锚定的粒子（`anchored=True`） |
 |---|---|
-| back | `iy == ny`（顶部，连横梁）或 `ix in {0, nx}`（连立柱） |
-| left/right | `iy == ny`（顶）或 `iz == 0`（前缘连立柱） |
+| back | `iy == ny`（顶部，连横梁）或 `ix in {0, nx}`（连立柱）或 `iy == 0`（**v2**：底缘连地面） |
+| left/right | `iy == ny`（顶）或 `iz == 0`（前缘连立柱）或 `iy == 0`（**v2**：底缘连地面） |
 | top | `iz == 0`（前缘连横梁）或 `ix in {0, nx}`（连立柱） |
 
 锚定 → 该粒子 `inverse_mass = 0`，所有约束求解中只读不写。
+
+**v2 例外**：`shape.stay_count > 0` 时，后上 2 个角粒子（`PANEL_BACK` 的 `(0, ny)` 和 `(nx, ny)`，dedup 共享了 side/top 同位置粒子）的 `anchored` 标志在 `_add_support_stays` 里被显式改为 `False`——它们不再被钉在空中，由物理 stay 绳承重（见 §3.6）。
 
 ### 3.3 球门柱 3 段胶囊（`_make_goalpost_segments`）
 
@@ -255,6 +265,19 @@ panel_friction:    float32[4]
 ```
 
 **Panel id 映射（必须固定）**：`back=0`, `left=1`, `right=2`, `top=3`。在 Warp kernel 里通过 `panel_restitution[panel_id]` 拿系数，避免字符串。
+
+### 3.6 物理支撑绳（v2 新增，`_add_support_stays`）
+
+真实球门网后侧由 2~4 根绳拉到斜上方锚点。v2 把这套机制建模成普通粒子 + 距离约束：
+
+1. **角脱锚**：取 back 面的后上左角 `(0, ny)` 与后上右角 `(nx, ny)`（dedup 共享 side/top 顶后角同位置粒子），把这些粒子的 `anchored` 改为 `False`。
+2. **加 stake ghost 粒子**：每根绳在 `(±(W/2 + offset_x), corner_y + offset_y, -depth - offset_z)` 处加一个 `Particle`，`anchored=True`、`inverse_mass=0`、`panel=PANEL_BACK`（panel id 仅供 collision restitution 查表使用；stake 几乎不会被球碰到）。stake 粒子索引记入 `topo.stake_particle_indices`。
+3. **加 stretch 距离约束**：corner ↔ stake 之间加一条 `DistanceConstraint`，`kind=0`（stretch）、`stiffness = rope.stretch_stiffness`、`rest_length = 几何距离`。这样绳在 rest 时正好绷紧。
+4. **viewer**：stake 不在 `panel_particle_indices` 里所以不会被画成网粒子；stay 约束索引集合 `{s.constraint}` 在 mesh rope 渲染里排除；每帧从当前 `particle_positions[corner]` 到 `particle_positions[stake]` 画一条独立的 stay 线（颜色 `(220,200,80)` 区别于 mesh）。
+
+默认配置 (`stay_count=2`, `offset=(0.3, 0.6, 0.4)`)：每根绳长 ~0.78 m，角粒子被斜上拉向 `(-3.96, 3.04, -2.4)` / `(3.96, 3.04, -2.4)`。
+
+**物理后果**：拿掉 stay 绳后整个后网会塌——后上角没有任何其他锚定路径。这是设计意图。
 
 ### 3.5 索引稳定性保证（`stable_signature` 测试）
 
@@ -1308,6 +1331,14 @@ if early-out triggered:
 
 **Warp 重写主线先做**，把 §10.1 / §10.2 这两个 bug 顺便修了（修在 CPU reference 也修一次，保持两版同步）。§10.3 是数据多样性问题，可在所有重写完成后再迭代。
 
+### 10.5 v2 已实施（详见 §15 changelog）
+
+- **D 网面焊接**：`_back_position` 的 z 偏移加 `4·u/nx·(1-u/nx)` 调制，左右边为零 → back 左右边 z 恒 `-depth`，与侧网后边完全重合，dedup 抓住（粒子 540 → 524）
+- **E 底缘锚地**：`_is_anchored` 给 back/side 加 `iy == 0` 规则，模拟网底拴到地面
+- **F 低速接触跳过 impulse**：`k_apply_segment_response` 检查 `|v_before| >= impulse_speed_threshold`(默认 1.0) 才注入冲量到绳
+- **G 物理支撑绳**：见 §3.6
+- **H 后网兜状**：`back_pocket_depth` 在 `_back_position` 里加 2D 双向 bulge，四边为零
+
 ---
 
 ## 11. 验收与数值对齐标准
@@ -1457,7 +1488,59 @@ rerun Agent/Temp/dataset_v1_preview.rrd
 
 ---
 
-**文档版本**：v1
-**最后更新**：2026-05-15
-**作者**：CodeMaker AI（基于 progress.md / design.md / 当前 solver.py 实现）
+## 15. v2 Changelog（2026-05-16）
+
+v2 是在 Warp 实现首次跑通后基于视觉验证发现的问题做的真实度增强。**所有改动在 `net-sim` 仓库已合入 main**。
+
+### 15.1 拓扑
+
+| 改动 | 文件 | 影响 |
+|---|---|---|
+| 后网 z 偏移按 u 调制为零边缘 | `topology._back_position` | back 左右边与侧网后边 dedup 焊接 |
+| `back_pocket_depth=0.30` 双向 bulge | `topology._back_position` | 后网中心兜状鼓 30cm |
+| `iy==0` 加入 back/side anchor 规则 | `topology._is_anchored` | 网底拴地，不再像旗子飘 |
+| `_add_support_stays` | `topology` | 后上 2 角脱锚，加 2 个 stake ghost 粒子 + 2 根 stretch 距离约束 |
+| `SupportStay` 结构含 `corner_particle / stake_particle / constraint` 索引 | `topology` | viewer 可识别 stay 并独立渲染 |
+
+**新拓扑统计**（默认参数）：粒子 526（= 524 mesh + 2 stake）、距离约束 1898（= 1896 mesh + 2 stay）、anchored 粒子 141（多 35 个底缘 + 2 个 stake，少 2 个后上角）。
+
+### 15.2 物理 / Solver
+
+| 改动 | 文件 | 影响 |
+|---|---|---|
+| `rope.impulse_speed_threshold=1.0` | `params.RopeParams` + `solver_warp.k_apply_segment_response` | 球速 < 阈值时 swept 不再注能给绳，防止持续低速接触把网"鞭"得震荡 |
+
+### 15.3 Viewer
+
+| 改动 | 文件 | 影响 |
+|---|---|---|
+| `--public-host` flag | `cli` + `viewer_rerun` | 重写 rerun 0.32 `serve_grpc` 默认硬编码的 `127.0.0.1` URI |
+| 启动时打印完整 `?url=` URL | `viewer_rerun` | rerun 0.32 web viewer 不从 HTML 注入连接 URL，必须查询参数传 |
+| 每样本独立 `RecordingStream`(recording_id=sample_id) | `viewer_rerun` | 多样本时左上角"Recordings"列表可切换 |
+| 根 entity 声明 `RIGHT_HAND_Y_UP` | `viewer_rerun._log_sample` | 防止 rerun 默认 Z-up 把场景画歪 |
+| Stake 粒子从网渲染中排除（`stake_particle_indices`） | `viewer_rerun` | ghost 粒子不被画成网粒子 |
+| Stay 约束从 mesh rope 渲染中排除，独立动态画 | `viewer_rerun` | 角粒子摆动时 stay 线跟着动 |
+
+### 15.4 SSH tunnel / 网络
+
+rerun 0.32 把 web viewer 拆成两个端口：HTTP HTML 在 9090，gRPC 数据在 9091。SSH tunnel 必须同时转发两个：
+
+```bash
+ssh -L 9090:localhost:9090 -L 9091:localhost:9091 user@gpu-host
+```
+
+只转发 9090 会看到"Loading Application Bundle"卡住或"Failed to load entries"。
+
+### 15.5 仓库
+
+代码托管于 https://github.com/bayzhen/net-sim 的 `main` 分支。提交历史：
+- `d8081ed` Initial Warp 实现（v1）
+- `4030d7f` viewer: `--public-host` 修 0.32 硬编码
+- 后续 v2 修改尚未单独 commit（本次任务一起 push）
+
+---
+
+**文档版本**：v2
+**最后更新**：2026-05-16
+**作者**：CodeMaker AI（v1，2026-05-15）+ Claude（Warp 实现 + v2 增强，2026-05-15..16）
 

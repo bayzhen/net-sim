@@ -71,12 +71,30 @@ class GoalpostSegment:
 
 
 @dataclass
+class SupportStay:
+    """Physical support-stay rope between a net corner particle and a ground
+    stake. The stake itself is a normal Particle (anchored, inverse_mass=0).
+    The rope is a normal stretch DistanceConstraint. This struct records the
+    indices so the viewer can render the stay specially and the user/tests
+    can introspect it.
+    """
+    index: int
+    name: str
+    corner_particle: int  # particle index on the net (un-anchored)
+    stake_particle: int   # particle index of the ground stake (anchored)
+    constraint: int       # distance-constraint index of the stay rope
+    radius: float = 0.012
+
+
+@dataclass
 class Topology:
     particles: List[Particle] = field(default_factory=list)
     distance_constraints: List[DistanceConstraint] = field(default_factory=list)
     anchor_constraints: List[AnchorConstraint] = field(default_factory=list)
     goalpost_segments: List[GoalpostSegment] = field(default_factory=list)
+    support_stays: List[SupportStay] = field(default_factory=list)
     panel_particle_indices: Dict[int, List[int]] = field(default_factory=dict)
+    stake_particle_indices: List[int] = field(default_factory=list)
 
     @property
     def num_particles(self) -> int:
@@ -116,8 +134,18 @@ def _back_position(p: GoalNetParams, u: int, v: int, nx: int, ny: int) -> Vec3:
     H = p.goal.height
     x = -W / 2 + (u / nx) * W if nx > 0 else 0.0
     y = (v / ny) * H if ny > 0 else 0.0
+    # Two bulges in -z direction, both vanish at all four edges so back-panel
+    # seams with side/top/floor stay welded:
+    # - back_slope: small bottom-middle "tilt-back" near the floor
+    # - back_pocket_depth: bigger 2D bulge representing the support stays
+    #   pulling the net's centre outward into a pocket shape
     frac_top = (v / ny) if ny > 0 else 1.0
-    z = -p.goal.depth - p.shape.back_slope * (1.0 - frac_top) ** 2
+    frac_u = (u / nx) if nx > 0 else 0.5
+    bulge_u = 4.0 * frac_u * (1.0 - frac_u)
+    bulge_v = 4.0 * frac_top * (1.0 - frac_top)
+    slope_bulge = p.shape.back_slope * (1.0 - frac_top) ** 2 * bulge_u
+    pocket_bulge = p.shape.back_pocket_depth * bulge_u * bulge_v
+    z = -p.goal.depth - slope_bulge - pocket_bulge
     return (x, y, z)
 
 
@@ -160,18 +188,18 @@ def _top_position(p: GoalNetParams, u: int, v: int, nx: int, nz: int) -> Vec3:
 
 
 def _is_anchored(panel: int, u: int, v: int, nx_or_nz: int, ny_or_nz: int) -> bool:
-    """Per §3.2:
+    """Per §3.2 + bottom-edge ground anchoring (fix A: net bottom stays put):
 
-    | back       | iy == ny or ix in {0, nx} |
-    | left/right | iy == ny or iz == 0       |
-    | top        | iz == 0 or ix in {0, nx}  |
+    | back       | iy == ny or ix in {0, nx} or iy == 0 |
+    | left/right | iy == ny or iz == 0 or iy == 0       |
+    | top        | iz == 0 or ix in {0, nx}             |
     """
     if panel == PANEL_BACK:
         nx, ny = nx_or_nz, ny_or_nz
-        return v == ny or u == 0 or u == nx
+        return v == ny or u == 0 or u == nx or v == 0
     if panel in (PANEL_LEFT, PANEL_RIGHT):
         nz, ny = nx_or_nz, ny_or_nz
-        return v == ny or u == 0
+        return v == ny or u == 0 or v == 0
     if panel == PANEL_TOP:
         nx, nz = nx_or_nz, ny_or_nz
         return v == 0 or u == 0 or u == nx
@@ -347,6 +375,109 @@ def _make_goalpost_segments(params: GoalNetParams) -> List[GoalpostSegment]:
     ]
 
 
+def _add_support_stays(
+    topo: Topology, params: GoalNetParams, grid: _PanelGrid, nx: int, ny: int, nz: int
+) -> None:
+    """Make the back-top corners (and optionally back-bottom) physically hang
+    from ground stakes via stretch ropes. Each stay:
+
+      1. Picks a net corner particle (already created during _add_panel).
+      2. Marks that corner as NOT anchored (so it can swing).
+      3. Adds a new "stake" Particle at the ground stake position, with
+         inverse_mass=0 (anchored hard).
+      4. Adds a stretch DistanceConstraint between corner and stake. The rest
+         length is the geometric distance, so the stay is taut at the rest
+         configuration.
+
+    If no stays are configured, the back-top corners stay anchored to their
+    rest positions and the function is a no-op.
+    """
+    shape = params.shape
+    if shape.stay_count <= 0:
+        return
+    W = params.goal.width
+    D = params.goal.depth
+    stretch_stiff = params.rope.stretch_stiffness
+
+    # Corner descriptions: (name, panel_lookup_args, x_sign)
+    corners: List[Tuple[str, int, int, int, float]] = [
+        ("stay_back_top_left", PANEL_BACK, 0, ny, -1.0),
+        ("stay_back_top_right", PANEL_BACK, nx, ny, +1.0),
+    ]
+    if shape.stay_count >= 4:
+        corners += [
+            ("stay_back_bottom_left", PANEL_BACK, 0, 0, -1.0),
+            ("stay_back_bottom_right", PANEL_BACK, nx, 0, +1.0),
+        ]
+
+    for stay_idx, (name, panel, u, v, x_sign) in enumerate(corners):
+        corner_idx = grid.lookup(panel, u, v)
+        if corner_idx is None:
+            continue
+        corner = topo.particles[corner_idx]
+        # 2) un-anchor the corner so the stay rope is what holds it up
+        if corner.anchored:
+            topo.particles[corner_idx] = Particle(
+                index=corner.index,
+                position=corner.position,
+                panel=corner.panel,
+                u=corner.u,
+                v=corner.v,
+                anchored=False,
+            )
+
+        # 3) add the elevated stake anchor (up-and-back from the corner, like
+        # the eyelet on a real goal's upper rear bar)
+        corner_pos_for_offset = corner.position
+        stake_pos: Vec3 = (
+            x_sign * (W / 2 + shape.stay_anchor_offset_x),
+            corner_pos_for_offset[1] + shape.stay_anchor_offset_y,
+            -D - shape.stay_anchor_offset_z,
+        )
+        stake_idx = len(topo.particles)
+        topo.particles.append(
+            Particle(
+                index=stake_idx,
+                position=stake_pos,
+                panel=PANEL_BACK,  # any valid panel; stake doesn't really collide
+                u=-1,
+                v=-1,
+                anchored=True,
+            )
+        )
+        topo.stake_particle_indices.append(stake_idx)
+
+        # 4) add the rope as a normal stretch distance constraint
+        corner_pos = topo.particles[corner_idx].position
+        rest_length = math.sqrt(
+            (stake_pos[0] - corner_pos[0]) ** 2
+            + (stake_pos[1] - corner_pos[1]) ** 2
+            + (stake_pos[2] - corner_pos[2]) ** 2
+        )
+        constraint_idx = len(topo.distance_constraints)
+        topo.distance_constraints.append(
+            DistanceConstraint(
+                index=constraint_idx,
+                i0=corner_idx,
+                i1=stake_idx,
+                rest_length=rest_length,
+                stiffness=stretch_stiff,
+                kind=0,
+                panel=PANEL_BACK,
+            )
+        )
+
+        topo.support_stays.append(
+            SupportStay(
+                index=stay_idx,
+                name=name,
+                corner_particle=corner_idx,
+                stake_particle=stake_idx,
+                constraint=constraint_idx,
+            )
+        )
+
+
 def generate_topology(params: GoalNetParams) -> Topology:
     nx = max(1, round(params.goal.width / params.grid.cell_size_x))
     ny = max(1, round(params.goal.height / params.grid.cell_size_y))
@@ -366,6 +497,10 @@ def generate_topology(params: GoalNetParams) -> Topology:
     _add_panel_constraints(topo, grid, PANEL_RIGHT, nz, ny, params.rope.stretch_stiffness, params.rope.bend_stiffness, seen)
     _add_panel_constraints(topo, grid, PANEL_TOP, nx, nz, params.rope.stretch_stiffness, params.rope.bend_stiffness, seen)
 
+    # Stays must be added BEFORE anchor constraints — they un-anchor the
+    # back-top corner particles and add the ground-stake particles that get
+    # anchored instead.
+    _add_support_stays(topo, params, grid, nx, ny, nz)
     _add_anchor_constraints(topo, params)
     topo.goalpost_segments = _make_goalpost_segments(params)
     return topo
@@ -390,6 +525,8 @@ def stable_signature(topo: Topology) -> str:
         upd("A", a.index, a.particle, a.target, a.stiffness, a.hard)
     for g in topo.goalpost_segments:
         upd("G", g.index, g.name, g.p0, g.p1, g.radius, g.kind)
+    for s in topo.support_stays:
+        upd("S", s.index, s.name, s.corner_particle, s.stake_particle, s.constraint)
     for panel, idxs in sorted(topo.panel_particle_indices.items()):
         upd("PI", panel, tuple(idxs))
     return hasher.hexdigest()
@@ -407,6 +544,7 @@ def summary(topo: Topology) -> Dict[str, int]:
         "bend_constraints": bend,
         "anchor_constraints": len(topo.anchor_constraints),
         "goalpost_segments": len(topo.goalpost_segments),
+        "support_stays": len(topo.support_stays),
     }
 
 
