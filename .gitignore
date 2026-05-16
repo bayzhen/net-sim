@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
-
+.venv/
 # Generated datasets & rerun recordings
 Agent/Temp/
 *.rrd

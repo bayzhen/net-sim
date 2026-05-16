@@ -5,6 +5,8 @@ Subcommands:
     generate       — run sampler + warp solver + write outputs
     view-rerun     — open one or more raw samples in rerun (web or save)
     train          — train the MLP surrogate on a generated HDF5 dataset
+    train-online   — online training pipeline: sim → frame pool → train,
+                     same GPU, no dataset.h5 needed (eliminates epoch overfit)
     predict        — evaluate a trained checkpoint on the test split
 """
 from __future__ import annotations
@@ -277,6 +279,17 @@ def cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train_online(args: argparse.Namespace) -> int:
+    from train import online_cfg_from_args, run_online_training
+
+    cfg = online_cfg_from_args(args)
+    paths = run_online_training(cfg)
+    print("wrote:")
+    for k, v in paths.items():
+        print(f"  {k}: {v}")
+    return 0
+
+
 def cmd_predict(args: argparse.Namespace) -> int:
     from predict import evaluate_per_frame
 
@@ -349,6 +362,15 @@ def build_parser() -> argparse.ArgumentParser:
     from train import add_train_args
     add_train_args(p_train)
     p_train.set_defaults(func=cmd_train)
+
+    p_train_online = sub.add_parser(
+        "train-online",
+        help="online training: simulate fresh batches and feed them straight "
+        "into the trainer (no dataset.h5 required, eliminates overfitting)",
+    )
+    from train import add_train_online_args
+    add_train_online_args(p_train_online)
+    p_train_online.set_defaults(func=cmd_train_online)
 
     p_predict = sub.add_parser("predict", help="evaluate a trained checkpoint")
     from predict import add_predict_args
