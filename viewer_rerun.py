@@ -102,10 +102,56 @@ def view_rerun(
             "rerun-sdk is not installed; run `pip install rerun-sdk`"
         ) from e
 
-    # The default recording is what serve_grpc attaches to. Each sample gets
-    # its own RecordingStream (same application_id, unique recording_id) so
-    # the rerun viewer lists them as separate, switchable recordings.
-    rr.init("goal_net_xpbd_dataset", spawn=spawn)
+    sample_paths = list(sample_paths)
+
+    # Use a single RecordingStream so that:
+    #  * the .rrd file gets exactly one valid header (multiple `rr.save`
+    #    calls on different recordings into the same path produces a corrupt
+    #    rrd that the viewer cannot decode),
+    #  * the web viewer immediately shows data on page load (no need to
+    #    manually pick a recording from the top-left dropdown).
+    # Different samples are separated by entity-path prefix (`world/<id>/...`).
+    rec = rr.RecordingStream(
+        application_id="goal_net_xpbd_dataset",
+        recording_id="dataset",
+    )
+    if spawn:
+        # `rr.spawn()` shells out to a `rerun` binary on PATH. The pip
+        # install of rerun-sdk on Windows ships its viewer at
+        #   <site-packages>/rerun_sdk/rerun_cli/rerun.exe
+        # which is *not* on PATH, so the default spawn fails with
+        #   "Failed to find Rerun Viewer executable in PATH."
+        # We resolve the bundled exe ourselves and start it as a gRPC
+        # client of an in-process server, so all data flows live without
+        # touching disk.
+        import os
+        import subprocess
+        import sys as _sys
+
+        cli_dir = Path(rr.__file__).resolve().parent.parent / "rerun_cli"
+        exe = cli_dir / ("rerun.exe" if os.name == "nt" else "rerun")
+        if not exe.exists():
+            # fall back to whatever rr.spawn would have found (PATH)
+            rr.spawn(recording=rec)
+        else:
+            # Pick a free-ish gRPC port; default 9876 works unless taken.
+            spawn_grpc_port = 9876
+            spawn_uri = rr.serve_grpc(
+                grpc_port=spawn_grpc_port,
+                recording=rec,
+                server_memory_limit="4GB",
+            )
+            print(
+                f"launching native rerun viewer: {exe}\n"
+                f"connecting it to {spawn_uri}",
+                flush=True,
+            )
+            subprocess.Popen(
+                [str(exe), "--connect", spawn_uri],
+                stdout=_sys.stdout,
+                stderr=_sys.stderr,
+            )
+
     web_port = None
     grpc_port = None
     server_uri = None
@@ -113,26 +159,34 @@ def view_rerun(
         _, _, port_str = bind.partition(":")
         web_port = int(port_str) if port_str else 9090
         grpc_port = web_port + 1
-        server_uri = rr.serve_grpc(grpc_port=grpc_port)
+        # `serve_grpc(recording=rec)` already attaches `rec` as the gRPC
+        # sink — calling `connect_grpc` afterwards would make `rec` open a
+        # *second* (client) connection to its own server, double-buffering
+        # all data and frequently shutting the server down once the channel
+        # backpressures (you'd see
+        #   "Sender has been blocked for over 5 seconds ..."
+        # in the logs, after which port 9091 stops listening and the web
+        # page can't fetch any data).
+        server_uri = rr.serve_grpc(
+            grpc_port=grpc_port,
+            recording=rec,
+            server_memory_limit="4GB",
+        )
         rr.serve_web_viewer(
             web_port=web_port, open_browser=False, connect_to=server_uri
         )
     if save_path:
-        rr.save(save_path)
+        rr.save(save_path, recording=rec)
 
     for path in sample_paths:
         sample = json.loads(Path(path).read_text())
         sample_id = sample["shot"]["sample_id"]
-        rec = rr.RecordingStream(
-            application_id="goal_net_xpbd_dataset",
-            recording_id=sample_id,
-        )
-        if server_uri is not None:
-            rr.connect_grpc(url=server_uri, recording=rec)
-        if save_path:
-            # Append each per-sample recording to the same .rrd file.
-            rr.save(save_path, recording=rec)
-        _log_sample(rr, sample, prefix="world", recording=rec)
+        _log_sample(rr, sample, prefix=f"world/{sample_id}", recording=rec)
+
+    try:
+        rec.flush(blocking=True)
+    except Exception:
+        pass
 
     if serve and web_port is not None:
         # The rerun 0.32 web viewer reads its gRPC backend URL from the page's
@@ -141,9 +195,14 @@ def view_rerun(
         # print a ready-to-click URL with the encoded gRPC endpoint baked in.
         host = public_host or "localhost"
         grpc_uri = f"rerun+http://{host}:{grpc_port}/proxy"
+        # `hide_welcome_screen` keeps the rerun 0.32 web viewer from
+        # parking on the "Examples" landing page. Without it the viewer
+        # parses `?url=` but never auto-opens the recording — looks like
+        # "no data" to the user even though the gRPC backend is fine.
         full_url = (
             f"http://{host}:{web_port}/?url="
             + urllib.parse.quote(grpc_uri, safe="")
+            + "&hide_welcome_screen"
         )
         print(
             f"rerun web viewer listening on 0.0.0.0:{web_port} "
@@ -151,9 +210,31 @@ def view_rerun(
             flush=True,
         )
         print(f"open in browser: {full_url}", flush=True)
+        print(
+            f"loaded {len(sample_paths)} samples under entity 'world/<sample_id>'.",
+            flush=True,
+        )
         print("press Ctrl+C to stop.", flush=True)
         try:
-            signal.pause()
+            # Windows has no signal.pause(); keep process alive with sleep loop.
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            return
+
+    if spawn:
+        # Keep the in-process gRPC server (started above) alive so the
+        # native viewer window has something to talk to. Without this loop
+        # the Python process exits, the server shuts down, and the viewer
+        # window pops up empty.
+        print(
+            f"loaded {len(sample_paths)} samples under entity 'world/<sample_id>'.",
+            flush=True,
+        )
+        print("native rerun viewer launched. press Ctrl+C to stop.", flush=True)
+        try:
+            while True:
+                time.sleep(3600)
         except KeyboardInterrupt:
             return
 
