@@ -9,5 +9,8 @@ h5py
 # for CUDA 12.1, or cu124 / cu118 to match your CUDA driver).
 torch
 
+# RAM safety check before preloading large train splits
+psutil
+
 # Optional viewer
 rerun-sdk

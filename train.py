@@ -73,7 +73,8 @@ class TrainConfig:
     w_ball_vel: float = 1.0
     w_net: float = 1.0
     n_time_freq: int = 4
-    preload: bool = True
+    preload: bool = True             # default for train/val
+    preload_test: bool = False       # test runs once at the end; stream is fine
     smoke: bool = False  # tiny run for sanity
 
 
@@ -158,8 +159,29 @@ class OffsetFrameDataset:
 
         ball_bytes = n * F * 3 * 4
         net_bytes = n * F * N * 3 * 4 if self.load_particles else 0
-        total_gb = (ball_bytes * 2 + net_bytes) / (1024 ** 3)
+        total_bytes = ball_bytes * 2 + net_bytes
+        total_gb = total_bytes / (1024 ** 3)
         tag = f" [{label}]" if label else ""
+
+        # Sanity-check available RAM. We need not just `total_gb` for the
+        # cache itself, but also a comfortable buffer for the rest of the
+        # training pipeline (Welford accumulators, h5 chunk decompression,
+        # PyTorch staging, page cache for OS, etc.). 1.4x is a soft margin
+        # that has worked in practice; surface a clear error otherwise.
+        try:
+            import psutil  # type: ignore
+            avail = psutil.virtual_memory().available
+            need = int(total_bytes * 1.4)
+            if avail < need:
+                raise MemoryError(
+                    f"preload{tag}: would need ~{need/(1024**3):.1f} GB free "
+                    f"(cache itself is {total_gb:.1f} GB; we leave a 1.4x margin) "
+                    f"but only {avail/(1024**3):.1f} GB available. "
+                    f"Pass --no-preload to fall back to HDF5 streaming."
+                )
+        except ModuleNotFoundError:
+            pass  # psutil is optional; user takes their chances
+
         print(f"  preload{tag}: allocating {total_gb:.2f} GB RAM "
               f"({n} samples × F={F} × N={N})", flush=True)
         t0 = time.time()
@@ -405,9 +427,13 @@ def compute_norm_stats(train_ds: "OffsetFrameDataset", n_time_freq: int,
                        max_samples_for_input: int = 8192) -> Dict[str, "torch.Tensor"]:
     """Compute mean/std for input features and targets from the train split.
 
-    For target stats we use **all frames of all train samples** (so the
-    estimator is very tight); for input stats we just need ``n`` samples
-    × ``n_time_freq*2 + 10`` so 8192 is plenty.
+    Memory note
+    -----------
+    The naive ``net_cache.mean(axis=(0, 1))`` allocates a temporary buffer
+    that is comparable in size to ``net_cache`` itself (~50 GB for our
+    14k-sample subset). On a machine where the cache already eats 50 GB
+    that triggers OOM. We instead accumulate sums and squared-sums in a
+    streaming fashion (one sample at a time = 1.2 MB peak temp).
 
     Requires ``train_ds.preload == True`` so we can iterate the cached
     arrays without re-reading HDF5.
@@ -419,6 +445,7 @@ def compute_norm_stats(train_ds: "OffsetFrameDataset", n_time_freq: int,
 
     n = len(train_ds)
     F = train_ds.frame_count
+    N = train_ds.particle_count
 
     # ------- input statistics (sample many random (idx, frame) pairs) -------
     rng = np.random.default_rng(123456)
@@ -444,26 +471,60 @@ def compute_norm_stats(train_ds: "OffsetFrameDataset", n_time_freq: int,
         n_time_freq=n_time_freq,
     )
     in_mean = feats.mean(0)
-    in_std = feats.std(0)
-    # Avoid std=0 on constant features (radius/mass/sin(2pi*0)=0 etc.).
-    in_std = torch.clamp(in_std, min=1e-3)
+    in_std = torch.clamp(feats.std(0), min=1e-3)
 
-    # ------- target statistics (use all frames) -------
-    bp = train_ds._ball_pos_cache.reshape(-1, 3)        # (n*F, 3)
-    bv = train_ds._ball_vel_cache.reshape(-1, 3)
-    ball_pos_mean = torch.from_numpy(bp.mean(axis=0))
-    ball_pos_std = torch.from_numpy(bp.std(axis=0))
-    ball_vel_mean = torch.from_numpy(bv.mean(axis=0))
-    ball_vel_std = torch.from_numpy(bv.std(axis=0))
-    ball_pos_std = torch.clamp(ball_pos_std, min=1e-3)
-    ball_vel_std = torch.clamp(ball_vel_std, min=1e-3)
+    # ------- target statistics: streaming accumulate over samples -------
+    # We keep float64 accumulators (small: 3 + 3 + N*3 = 1551 doubles).
+    sum_bp = np.zeros(3, dtype=np.float64)
+    sumsq_bp = np.zeros(3, dtype=np.float64)
+    sum_bv = np.zeros(3, dtype=np.float64)
+    sumsq_bv = np.zeros(3, dtype=np.float64)
+    sum_net = np.zeros((N, 3), dtype=np.float64)
+    sumsq_net = np.zeros((N, 3), dtype=np.float64)
+    total_frames = 0
 
-    # Per-particle mean/std: (N, 3). Computing on CPU with float32 avoids
-    # the (n*F, N, 3) reshape blowup; just reduce along axes 0,1.
-    net_cache = train_ds._net_cache  # (n, F, N, 3)
-    net_mean = torch.from_numpy(net_cache.mean(axis=(0, 1)).astype(np.float32))
-    net_std = torch.from_numpy(net_cache.std(axis=(0, 1)).astype(np.float32))
-    net_std = torch.clamp(net_std, min=1e-3)
+    bp_cache = train_ds._ball_pos_cache
+    bv_cache = train_ds._ball_vel_cache
+    net_cache = train_ds._net_cache
+
+    # Process one sample at a time — peak temporary is one (F, N, 3) ~3.5 MB.
+    log_every = max(n // 20, 1)
+    t0 = time.time()
+    for i in range(n):
+        bp = bp_cache[i]                       # (F, 3) view, no copy
+        bv = bv_cache[i]
+        net = net_cache[i]                     # (F, N, 3) view, no copy
+        sum_bp += bp.sum(axis=0, dtype=np.float64)
+        sumsq_bp += (bp.astype(np.float64) ** 2).sum(axis=0)
+        sum_bv += bv.sum(axis=0, dtype=np.float64)
+        sumsq_bv += (bv.astype(np.float64) ** 2).sum(axis=0)
+        # For the (F, N, 3) slab we cast to float64 in-place for the squaring;
+        # the temp here is one sample = ~7 MB float64, OK.
+        net64 = net.astype(np.float64, copy=False)
+        sum_net += net64.sum(axis=0)
+        sumsq_net += (net64 ** 2).sum(axis=0)
+        total_frames += F
+        if (i + 1) % log_every == 0 or i + 1 == n:
+            print(f"    stats [{i+1:5d}/{n}]", flush=True)
+
+    M = float(total_frames)
+    ball_pos_mean_np = sum_bp / M
+    ball_vel_mean_np = sum_bv / M
+    net_mean_np = sum_net / M
+    # var = E[x^2] - E[x]^2; clamp negative residuals from FP error.
+    ball_pos_var_np = np.maximum(sumsq_bp / M - ball_pos_mean_np ** 2, 0.0)
+    ball_vel_var_np = np.maximum(sumsq_bv / M - ball_vel_mean_np ** 2, 0.0)
+    net_var_np = np.maximum(sumsq_net / M - net_mean_np ** 2, 0.0)
+
+    ball_pos_mean = torch.from_numpy(ball_pos_mean_np.astype(np.float32))
+    ball_vel_mean = torch.from_numpy(ball_vel_mean_np.astype(np.float32))
+    net_mean = torch.from_numpy(net_mean_np.astype(np.float32))
+    ball_pos_std = torch.clamp(torch.from_numpy(np.sqrt(ball_pos_var_np).astype(np.float32)), min=1e-3)
+    ball_vel_std = torch.clamp(torch.from_numpy(np.sqrt(ball_vel_var_np).astype(np.float32)), min=1e-3)
+    net_std = torch.clamp(torch.from_numpy(np.sqrt(net_var_np).astype(np.float32)), min=1e-3)
+
+    print(f"    streaming stats: {time.time()-t0:.1f}s "
+          f"({total_frames} frames)", flush=True)
 
     return {
         "in_mean": in_mean,
@@ -501,7 +562,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
     val_ds   = OffsetFrameDataset(cfg.dataset, va_idx, rng_seed=cfg.seed + 1,
                                    preload=cfg.preload, preload_label="val")
     test_ds  = OffsetFrameDataset(cfg.dataset, te_idx, rng_seed=cfg.seed + 2,
-                                   preload=cfg.preload, preload_label="test")
+                                   preload=cfg.preload_test, preload_label="test")
 
     # When data is in RAM, multi-worker DataLoader is pure overhead (each
     # fork would COW-touch our 50+ GB cache). Force single-process.
@@ -726,11 +787,18 @@ def add_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--w-net", dest="w_net", type=float, default=1.0)
     p.add_argument(
         "--no-preload", dest="preload", action="store_false",
-        help="disable preloading the train/val/test arrays into RAM. "
-        "Default: preload (uses ~52 GB RAM for a 14k-clean-sample subset, "
-        "but makes training ~20x faster by removing HDF5 I/O from the loop).",
+        help="disable preloading the train+val arrays into RAM. "
+        "Default: preload train+val (uses ~52 GB RAM for a 14k-clean-sample "
+        "subset, but makes training ~20x faster by removing HDF5 I/O from "
+        "the loop).",
     )
     p.set_defaults(preload=True)
+    p.add_argument(
+        "--preload-test", dest="preload_test", action="store_true",
+        help="also preload the test split (default: stream from HDF5 since "
+        "test runs only once at end-of-training).",
+    )
+    p.set_defaults(preload_test=False)
     p.add_argument("--smoke", action="store_true",
                    help="tiny run (1280 samples, 2 epochs) for sanity")
 
@@ -760,6 +828,7 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         w_net=args.w_net,
         n_time_freq=args.n_time_freq,
         preload=args.preload,
+        preload_test=args.preload_test,
         smoke=args.smoke,
     )
 
