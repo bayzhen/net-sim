@@ -72,6 +72,7 @@ class TrainConfig:
     w_ball_pos: float = 1.0
     w_ball_vel: float = 1.0
     w_net: float = 1.0
+    preload: bool = True
     smoke: bool = False  # tiny run for sanity
 
 
@@ -83,17 +84,20 @@ class TrainConfig:
 class OffsetFrameDataset:
     """torch.utils.data.Dataset compatible.
 
-    Each item returns the **full** ``(F, N, 3)`` particle trajectory and
-    ``(F, 3)`` ball trajectory plus the per-sample initial state. We then
-    randomly pick one offset frame inside ``collate`` (on CPU) — this is
-    much cheaper than 512 random h5 single-frame reads per batch because
-    the dataset's HDF5 chunks are shaped ``(1, F, N, 3)`` (one chunk per
-    sample), so reading a full slab hits exactly one chunk and is ~1000x
-    faster than fancy-indexing one frame at a time.
+    Two access modes:
 
-    Empirical benchmark on E:/dataset_v2/dataset.h5:
-        random single-frame read:  ~2.7 ms / sample
-        full (F, N, 3) read:       ~0.06 ms / sample (chunk-aligned)
+    * ``preload=False`` (h5 streaming): each ``__getitem__`` reads one
+      ``(F, N, 3)`` chunk from disk and slices a single frame. Cheap on
+      memory but I/O bound — typically ~30s/epoch on NVMe.
+    * ``preload=True`` (RAM cache): loads ALL particle / ball / input
+      arrays for the chosen sample indices into RAM up-front, then
+      ``__getitem__`` is a pure numpy index. Required for I/O-free
+      training. For 14k clean samples × (601 frames × 514 particles) the
+      cache is ~52 GB, so make sure your machine has the RAM.
+
+    Empirical (E:/dataset_v2/dataset.h5):
+        h5 streaming  ~3 ms/sample, GPU util ~0%
+        preload RAM   ~3 us/sample, GPU util saturated
     """
 
     def __init__(
@@ -102,6 +106,8 @@ class OffsetFrameDataset:
         sample_indices: np.ndarray,
         rng_seed: int = 0,
         load_particles: bool = True,
+        preload: bool = False,
+        preload_label: str = "",
     ) -> None:
         import h5py
 
@@ -109,6 +115,7 @@ class OffsetFrameDataset:
         self.path = h5_path
         self.indices = np.asarray(sample_indices, dtype=np.int64)
         self.load_particles = load_particles
+        self.preload = bool(preload)
         self._file: Optional["h5py.File"] = None
 
         # Read tiny metadata + per-sample inputs once into RAM.
@@ -116,12 +123,14 @@ class OffsetFrameDataset:
             self.frame_count = int(f.attrs["frame_count"])
             self.particle_count = int(f.attrs["particle_count"])
             self.frame_dt = float(f.attrs["frame_dt"])
-            # all S samples; we slice the chosen indices in __getitem__
             self.input_position = f["input_position"][:].astype(np.float32)
             self.input_velocity = f["input_velocity"][:].astype(np.float32)
             self.input_angular  = f["input_angular"][:].astype(np.float32)
             self.input_radius   = f["input_radius"][:].astype(np.float32)
             self.input_mass     = f["input_mass"][:].astype(np.float32)
+
+            if self.preload:
+                self._preload_arrays(f, label=preload_label)
 
         # Reproducible per-sample random offset: each item gets a frame
         # picked from this fixed table so two epochs see different frames
@@ -129,6 +138,66 @@ class OffsetFrameDataset:
         self._epoch_seed = rng_seed
         self._epoch_offsets: Optional[np.ndarray] = None
         self.set_epoch(0)
+
+    # ------------------------------------------------------------------
+    # Preload path
+    # ------------------------------------------------------------------
+
+    def _preload_arrays(self, f, label: str = "") -> None:
+        """Load ball_position/velocity and particle_position for the
+        chosen ``self.indices`` into contiguous RAM arrays.
+
+        We read sample-by-sample to keep peak memory bounded at one
+        sample's slab (~3.5 MB) above the destination array, and so we
+        can show progress for what is otherwise a multi-second wait.
+        """
+        n = int(self.indices.shape[0])
+        F = self.frame_count
+        N = self.particle_count
+
+        ball_bytes = n * F * 3 * 4
+        net_bytes = n * F * N * 3 * 4 if self.load_particles else 0
+        total_gb = (ball_bytes * 2 + net_bytes) / (1024 ** 3)
+        tag = f" [{label}]" if label else ""
+        print(f"  preload{tag}: allocating {total_gb:.2f} GB RAM "
+              f"({n} samples × F={F} × N={N})", flush=True)
+        t0 = time.time()
+
+        self._ball_pos_cache = np.empty((n, F, 3), dtype=np.float32)
+        self._ball_vel_cache = np.empty((n, F, 3), dtype=np.float32)
+        if self.load_particles:
+            self._net_cache = np.empty((n, F, N, 3), dtype=np.float32)
+        else:
+            self._net_cache = None
+
+        # Sort h5 read indices ascending for sequential file access — much
+        # friendlier to the page cache and reduces seek overhead even on
+        # NVMe. We then write into the destination at the original
+        # position (so __getitem__(i) keeps mapping to indices[i]).
+        order = np.argsort(self.indices)
+        bp = f["ball_position"]
+        bv = f["ball_velocity"]
+        pp = f["particle_position"] if self.load_particles else None
+
+        log_every = max(n // 20, 1)
+        for k, j in enumerate(order):
+            si = int(self.indices[int(j)])
+            self._ball_pos_cache[int(j)] = bp[si]
+            self._ball_vel_cache[int(j)] = bv[si]
+            if pp is not None:
+                self._net_cache[int(j)] = pp[si]
+            if (k + 1) % log_every == 0 or k + 1 == n:
+                pct = (k + 1) / n * 100
+                dt = time.time() - t0
+                rate = (k + 1) / max(dt, 1e-6)
+                eta = (n - k - 1) / max(rate, 1e-6)
+                print(f"    [{k+1:5d}/{n}] {pct:5.1f}%  "
+                      f"{rate:.0f} samp/s  ETA {eta:.1f}s", flush=True)
+        print(f"  preload{tag}: done in {time.time()-t0:.1f}s", flush=True)
+
+    # ------------------------------------------------------------------
+    # Common
+    # ------------------------------------------------------------------
 
     def set_epoch(self, epoch: int) -> None:
         """Reseed the per-sample frame-offset table for this epoch."""
@@ -157,23 +226,27 @@ class OffsetFrameDataset:
         return int(self.indices.shape[0])
 
     def __getitem__(self, i: int) -> Dict[str, np.ndarray]:
-        f = self._open()
         si = int(self.indices[i])
         frame = int(self._epoch_offsets[i])  # type: ignore[index]
         F = self.frame_count
         t_norm = np.float32(frame / max(F - 1, 1))
 
-        # Read FULL trajectories — one chunk-aligned read each:
-        #   ball_position[si]      shape (F, 3),    ~7 KB
-        #   ball_velocity[si]      shape (F, 3),    ~7 KB
-        #   particle_position[si]  shape (F, N, 3), ~3.5 MB (one HDF5 chunk)
-        # then pick the chosen frame in numpy (free).
-        ball_pos = f["ball_position"][si][frame].astype(np.float32, copy=False)
-        ball_vel = f["ball_velocity"][si][frame].astype(np.float32, copy=False)
-        if self.load_particles:
-            net = f["particle_position"][si][frame].astype(np.float32, copy=False)  # (N, 3)
+        if self.preload:
+            # In-memory path — ~free.
+            ball_pos = self._ball_pos_cache[i, frame]
+            ball_vel = self._ball_vel_cache[i, frame]
+            if self._net_cache is not None:
+                net = self._net_cache[i, frame]
+            else:
+                net = np.empty((self.particle_count, 3), dtype=np.float32)
         else:
-            net = np.empty((self.particle_count, 3), dtype=np.float32)
+            f = self._open()
+            ball_pos = f["ball_position"][si][frame].astype(np.float32, copy=False)
+            ball_vel = f["ball_velocity"][si][frame].astype(np.float32, copy=False)
+            if self.load_particles:
+                net = f["particle_position"][si][frame].astype(np.float32, copy=False)
+            else:
+                net = np.empty((self.particle_count, 3), dtype=np.float32)
 
         # 13-D input: pos(3) + vel(3) + ang(3) + radius + mass + t_norm + 1 spare
         input_state = np.concatenate([
@@ -289,24 +362,34 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
     print(f"split: train={tr_idx.size} val={va_idx.size} test={te_idx.size} "
           f"(of {n} clean samples)", flush=True)
 
-    train_ds = OffsetFrameDataset(cfg.dataset, tr_idx, rng_seed=cfg.seed)
-    val_ds   = OffsetFrameDataset(cfg.dataset, va_idx, rng_seed=cfg.seed + 1)
-    test_ds  = OffsetFrameDataset(cfg.dataset, te_idx, rng_seed=cfg.seed + 2)
+    train_ds = OffsetFrameDataset(cfg.dataset, tr_idx, rng_seed=cfg.seed,
+                                   preload=cfg.preload, preload_label="train")
+    val_ds   = OffsetFrameDataset(cfg.dataset, va_idx, rng_seed=cfg.seed + 1,
+                                   preload=cfg.preload, preload_label="val")
+    test_ds  = OffsetFrameDataset(cfg.dataset, te_idx, rng_seed=cfg.seed + 2,
+                                   preload=cfg.preload, preload_label="test")
+
+    # When data is in RAM, multi-worker DataLoader is pure overhead (each
+    # fork would COW-touch our 50+ GB cache). Force single-process.
+    effective_workers = 0 if cfg.preload else cfg.num_workers
+    if effective_workers != cfg.num_workers:
+        print(f"[note] preload=True; forcing num_workers=0 "
+              f"(was {cfg.num_workers})", flush=True)
 
     train_loader = DataLoader(
         train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, collate_fn=collate,
-        persistent_workers=cfg.num_workers > 0, pin_memory=True,
+        num_workers=effective_workers, collate_fn=collate,
+        persistent_workers=effective_workers > 0, pin_memory=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, collate_fn=collate,
-        persistent_workers=cfg.num_workers > 0, pin_memory=True,
+        num_workers=effective_workers, collate_fn=collate,
+        persistent_workers=effective_workers > 0, pin_memory=True,
     )
     test_loader = DataLoader(
         test_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, collate_fn=collate,
-        persistent_workers=cfg.num_workers > 0, pin_memory=True,
+        num_workers=effective_workers, collate_fn=collate,
+        persistent_workers=effective_workers > 0, pin_memory=True,
     )
 
     # --- model ---
@@ -477,6 +560,13 @@ def add_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--w-ball-pos", dest="w_ball_pos", type=float, default=1.0)
     p.add_argument("--w-ball-vel", dest="w_ball_vel", type=float, default=1.0)
     p.add_argument("--w-net", dest="w_net", type=float, default=1.0)
+    p.add_argument(
+        "--no-preload", dest="preload", action="store_false",
+        help="disable preloading the train/val/test arrays into RAM. "
+        "Default: preload (uses ~52 GB RAM for a 14k-clean-sample subset, "
+        "but makes training ~20x faster by removing HDF5 I/O from the loop).",
+    )
+    p.set_defaults(preload=True)
     p.add_argument("--smoke", action="store_true",
                    help="tiny run (1280 samples, 2 epochs) for sanity")
 
@@ -504,6 +594,7 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         w_ball_pos=args.w_ball_pos,
         w_ball_vel=args.w_ball_vel,
         w_net=args.w_net,
+        preload=args.preload,
         smoke=args.smoke,
     )
 
