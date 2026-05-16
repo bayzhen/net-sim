@@ -5,6 +5,7 @@ Subcommands:
     generate       — run sampler + warp solver + write outputs
     view-rerun     — open one or more raw samples in rerun (web or save)
     train          — train the MLP surrogate on a generated HDF5 dataset
+    predict        — evaluate a trained checkpoint on the test split
 """
 from __future__ import annotations
 
@@ -276,6 +277,23 @@ def cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_predict(args: argparse.Namespace) -> int:
+    from predict import evaluate_per_frame
+
+    paths = evaluate_per_frame(
+        h5_path=args.dataset,
+        ckpt_path=args.ckpt,
+        output_dir=args.output,
+        device_name=args.device,
+        sample_batch=args.sample_batch,
+        worst_k=args.worst_k,
+    )
+    print("\nwrote:")
+    for k, v in paths.items():
+        print(f"  {k}: {v}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="goal_net_xpbd")
     parser.add_argument("--params", help="JSON file overriding default params")
@@ -331,6 +349,11 @@ def build_parser() -> argparse.ArgumentParser:
     from train import add_train_args
     add_train_args(p_train)
     p_train.set_defaults(func=cmd_train)
+
+    p_predict = sub.add_parser("predict", help="evaluate a trained checkpoint")
+    from predict import add_predict_args
+    add_predict_args(p_predict)
+    p_predict.set_defaults(func=cmd_predict)
     return parser
 
 
