@@ -29,17 +29,17 @@ class GridParams:
 class RopeParams:
     radius: float = 0.018
     collision_radius: float = 0.16
-    particle_mass: float = 0.035
-    stretch_stiffness: float = 0.92
-    bend_stiffness: float = 0.18
-    damping: float = 0.035
-    friction: float = 0.32
-    restitution: float = 0.55
-    panel_restitution_back: float = 0.10
-    panel_restitution_top: float = 0.30
-    panel_restitution_side: float = 0.20
-    panel_friction_back_tangent: float = 0.80
-    impulse_clamp: float = 6.0
+    particle_mass: float = 0.020
+    stretch_stiffness: float = 0.35
+    bend_stiffness: float = 0.03
+    damping: float = 0.03
+    friction: float = 0.55
+    restitution: float = 0.32
+    panel_restitution_back: float = 0.05
+    panel_restitution_top: float = 0.18
+    panel_restitution_side: float = 0.12
+    panel_friction_back_tangent: float = 0.95
+    impulse_clamp: float = 40.0
     # Skip swept-impulse injection into the rope when the ball is barely
     # moving — repeated low-speed contact (e.g. ball rolling against the net
     # bottom after a ground bounce) otherwise pumps energy every substep and
@@ -75,6 +75,11 @@ class ShapeParams:
     stay_anchor_offset_x: float = 0.3   # outward from ±W/2
     stay_anchor_offset_y: float = 0.6   # above corner.y (= H by default)
     stay_anchor_offset_z: float = 0.4   # behind goal-back (= -depth)
+    # How much the stay-corners are pulled inward from their geometric
+    # corner positions in the rest shape, to convey that the stays are
+    # tugging the net into the goal.
+    stay_corner_pull_x: float = 0.15  # toward goal centre-line
+    stay_corner_pull_z: float = 0.15  # toward the pitch (+z)
 
 
 @dataclass
@@ -82,12 +87,19 @@ class SolverParams:
     frame_dt: float = 1.0 / 60.0
     substeps: int = 12
     iterations: int = 8
-    duration: float = 2.0
+    duration: float = 10.0
     gravity: Vec3 = (0.0, -9.81, 0.0)
     sample_every_frames: int = 1
     enable_bend_constraints: bool = True
     stuck_speed_threshold: float = 0.5
     stuck_duration_seconds: float = 0.3
+    # Quadratic air drag on the ball:  a_drag = -k * |v| * v
+    # where k = (rho_air * C_d * A) / (2 * m).  For a 1 kg, 0.13 m radius
+    # football in still air this lands around 0.008-0.012 m^-1.  The drag
+    # is direction-opposite-to-velocity and scales with v^2, so high-speed
+    # shots decelerate noticeably while a slow rolling ball is barely
+    # affected.  Set to 0.0 to disable.
+    ball_drag_coefficient: float = 0.010
 
 
 @dataclass
@@ -105,11 +117,11 @@ class CollisionParams:
 class GroundParams:
     enabled: bool = True
     y: float = 0.0
-    bounce_restitution: float = 0.8
-    bounce_speed_loss: float = 12.0
+    bounce_restitution: float = 0.55
+    bounce_speed_loss: float = 18.0
     bounce_to_roll_vertical_threshold: float = 2.0
     bounce_to_roll_total_threshold: float = 3.0
-    roll_speed_loss: float = 2.0
+    roll_speed_loss: float = 3.5
     bounce_floor_velocity_offset: float = 0.1
 
 
@@ -117,7 +129,7 @@ class GroundParams:
 class GoalpostParams:
     enabled: bool = True
     radius: float = 0.06
-    speed_change_factor: float = 0.6
+    speed_change_factor: float = 0.45
     crossbar_z_min_speed: float = 0.1
 
 

@@ -236,12 +236,21 @@ def k_integrate_ball(
     ball_prev: wp.array(dtype=wp.vec3),
     gravity: wp.vec3,
     dt: float,
+    drag_coeff: float,
     frozen: wp.array(dtype=int),
 ):
     b = wp.tid()
     if frozen[b] != 0:
         return
-    new_v = ball_vel[b] + gravity * dt
+    v = ball_vel[b]
+    # Quadratic air drag: a = -k * |v| * v.  Applied semi-implicitly via
+    # speed-based decay factor so the integrator stays stable even at
+    # high velocity:  v_new = v * (1 / (1 + k*|v|*dt)) + g*dt.
+    speed = wp.length(v)
+    if drag_coeff > 0.0 and speed > 0.0:
+        decay = 1.0 / (1.0 + drag_coeff * speed * dt)
+        v = v * decay
+    new_v = v + gravity * dt
     ball_vel[b] = new_v
     ball_prev[b] = ball_pos[b]
     ball_pos[b] = ball_pos[b] + new_v * dt
@@ -1230,7 +1239,7 @@ class XpbdWarpSolver:
                 wp.launch(
                     k_integrate_ball,
                     dim=B,
-                    inputs=[self.ball_pos_wp, self.ball_vel_wp, self.ball_prev_wp, gravity, sub_dt, frozen_wp],
+                    inputs=[self.ball_pos_wp, self.ball_vel_wp, self.ball_prev_wp, gravity, sub_dt, solver.ball_drag_coefficient, frozen_wp],
                     device=d,
                 )
                 # ball vs posts (must run before swept segments)

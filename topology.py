@@ -134,18 +134,18 @@ def _back_position(p: GoalNetParams, u: int, v: int, nx: int, ny: int) -> Vec3:
     H = p.goal.height
     x = -W / 2 + (u / nx) * W if nx > 0 else 0.0
     y = (v / ny) * H if ny > 0 else 0.0
-    # Two bulges in -z direction, both vanish at all four edges so back-panel
-    # seams with side/top/floor stay welded:
-    # - back_slope: small bottom-middle "tilt-back" near the floor
-    # - back_pocket_depth: bigger 2D bulge representing the support stays
-    #   pulling the net's centre outward into a pocket shape
+    # Two concavities in +z direction (toward the pitch / goal interior),
+    # both vanish at all four edges so back-panel seams with side/top/floor
+    # stay welded:
+    # - back_slope:   small bottom-middle "tilt-forward" near the floor
+    # - back_pocket:  bigger 2D concavity — centre pushed forward
     frac_top = (v / ny) if ny > 0 else 1.0
     frac_u = (u / nx) if nx > 0 else 0.5
     bulge_u = 4.0 * frac_u * (1.0 - frac_u)
     bulge_v = 4.0 * frac_top * (1.0 - frac_top)
     slope_bulge = p.shape.back_slope * (1.0 - frac_top) ** 2 * bulge_u
     pocket_bulge = p.shape.back_pocket_depth * bulge_u * bulge_v
-    z = -p.goal.depth - slope_bulge - pocket_bulge
+    z = -p.goal.depth + slope_bulge + pocket_bulge
     return (x, y, z)
 
 
@@ -153,13 +153,21 @@ def _left_position(p: GoalNetParams, u: int, v: int, nz: int, ny: int) -> Vec3:
     W = p.goal.width
     H = p.goal.height
     D = p.goal.depth
-    z = -(u / nz) * D if nz > 0 else 0.0
-    y = (v / ny) * H if ny > 0 else 0.0
-    # parabolic outward bulge: 0 at u=0 and u=nz so corners coincide with
-    # the back panel / posts.
-    t = (u / nz) if nz > 0 else 0.0
-    bulge = 4.0 * t * (1.0 - t) * p.shape.side_slope
-    x = -W / 2 - bulge
+    t_z = (u / nz) if nz > 0 else 0.0
+    z = -t_z * D
+    # parabolic inward concavity: x inward (toward goal centre) so the
+    # side net bows in.  0 at u=0 and u=nz so corners stay welded.
+    bulge = 4.0 * t_z * (1.0 - t_z) * p.shape.side_slope
+    x = -W / 2 + bulge
+    # top-sag: shared edge with the top panel.  At the top row (v=ny) the
+    # y coordinate follows the top panel's sag so every particle on the
+    # left-top edge is position-identical to its counterpart on the top
+    # panel's left edge, allowing dedup to weld them.  Rows below
+    # interpolate linearly from ground to the sagged top.
+    sag = 4.0 * t_z * (1.0 - t_z) * p.shape.top_sag
+    y_top = H - sag
+    t_y = (v / ny) if ny > 0 else 0.0
+    y = t_y * y_top
     return (x, y, z)
 
 
@@ -167,11 +175,16 @@ def _right_position(p: GoalNetParams, u: int, v: int, nz: int, ny: int) -> Vec3:
     W = p.goal.width
     H = p.goal.height
     D = p.goal.depth
-    z = -(u / nz) * D if nz > 0 else 0.0
-    y = (v / ny) * H if ny > 0 else 0.0
-    t = (u / nz) if nz > 0 else 0.0
-    bulge = 4.0 * t * (1.0 - t) * p.shape.side_slope
-    x = W / 2 + bulge
+    t_z = (u / nz) if nz > 0 else 0.0
+    z = -t_z * D
+    bulge = 4.0 * t_z * (1.0 - t_z) * p.shape.side_slope
+    # inward concavity (mirror of left panel): x moves toward centre.
+    x = W / 2 - bulge
+    # top-sag: shared edge with the top panel (mirror of _left_position).
+    sag = 4.0 * t_z * (1.0 - t_z) * p.shape.top_sag
+    y_top = H - sag
+    t_y = (v / ny) if ny > 0 else 0.0
+    y = t_y * y_top
     return (x, y, z)
 
 
@@ -179,11 +192,21 @@ def _top_position(p: GoalNetParams, u: int, v: int, nx: int, nz: int) -> Vec3:
     W = p.goal.width
     H = p.goal.height
     D = p.goal.depth
-    x = -W / 2 + (u / nx) * W if nx > 0 else 0.0
-    z = -(v / nz) * D if nz > 0 else 0.0
-    t = (v / nz) if nz > 0 else 0.0
-    sag = 4.0 * t * (1.0 - t) * p.shape.top_sag
+    t_z = (v / nz) if nz > 0 else 0.0
+    z = -t_z * D
+    # sag in y (existing behaviour).
+    sag = 4.0 * t_z * (1.0 - t_z) * p.shape.top_sag
     y = H - sag
+    # side bulge: shared edges with the left/right panels.  At the left
+    # edge (u=0) and right edge (u=nx) the x coordinate follows the side
+    # panel's inward concavity so particles coincide with their counterparts
+    # on the side panels' top edges, allowing dedup to weld them.
+    # Interior columns interpolate linearly between the two edges.
+    bulge = 4.0 * t_z * (1.0 - t_z) * p.shape.side_slope
+    x_left = -W / 2 + bulge
+    x_right = W / 2 - bulge
+    t_x = (u / nx) if nx > 0 else 0.0
+    x = x_left + t_x * (x_right - x_left)
     return (x, y, z)
 
 
@@ -416,10 +439,16 @@ def _add_support_stays(
             continue
         corner = topo.particles[corner_idx]
         # 2) un-anchor the corner so the stay rope is what holds it up
-        if corner.anchored:
+        #    AND pull the corner particle inward (toward goal centre + pitch)
+        #    to visually convey the tug of the stay rope.
+        cx, cy, cz = corner.position
+        cx += x_sign * shape.stay_corner_pull_x  # x_sign: -1 for left, +1 for right → always toward centre
+        cz += shape.stay_corner_pull_z           # toward the pitch (+z)
+        corner_pos_pulled: Vec3 = (cx, cy, cz)
+        if corner.anchored or corner.position != corner_pos_pulled:
             topo.particles[corner_idx] = Particle(
                 index=corner.index,
-                position=corner.position,
+                position=corner_pos_pulled,
                 panel=corner.panel,
                 u=corner.u,
                 v=corner.v,
@@ -427,7 +456,9 @@ def _add_support_stays(
             )
 
         # 3) add the elevated stake anchor (up-and-back from the corner, like
-        # the eyelet on a real goal's upper rear bar)
+        # the eyelet on a real goal's upper rear bar).  The stake position is
+        # derived from the *original* geometric corner so it stays fixed
+        # regardless of any cosmetic pull-in applied to the corner particle.
         corner_pos_for_offset = corner.position
         stake_pos: Vec3 = (
             x_sign * (W / 2 + shape.stay_anchor_offset_x),
