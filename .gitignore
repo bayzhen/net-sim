@@ -8,6 +8,13 @@ Agent/Temp/
 *.rrd
 tmp_*/
 
+# Probe / dataset throwaways
+probe_*.txt
+probe_*/
+smoke_*/
+dataset_v*.log
+*.h5
+
 # Editor / OS noise
 .vscode/
 .idea/

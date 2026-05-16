@@ -1,8 +1,16 @@
 """Web/offline viewer for goal-net XPBD samples using rerun.io.
 
-Reads raw/sample_*.json (full per-frame net state + contacts) and logs them
-to a rerun recording — either serve as a web viewer, save to .rrd, or open in
-the local GUI.
+Reads raw/sample_*.{json,npz} (full per-frame net state + contacts) and logs
+them to a rerun recording — either serve as a web viewer, save to .rrd, or
+open in the local GUI.
+
+Two on-disk raw formats are supported transparently:
+
+* legacy JSON  (raw/sample_*.json) — every sample is self-contained and
+  embeds a copy of ``topology`` + ``shot`` etc.
+* compact npz  (raw/sample_*.npz)  — only per-frame and contact arrays;
+  ``topology.json`` lives at the dataset root and is shared across all
+  samples (much smaller, much faster to write at scale).
 """
 from __future__ import annotations
 
@@ -11,9 +19,101 @@ import signal
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
+
+
+def _load_sample(path: Path) -> dict:
+    """Load a raw sample file (JSON or NPZ) and normalize it into the
+    legacy in-memory dict shape that the rest of the viewer expects:
+
+        {
+          "topology": {...},
+          "shot": {...},
+          "frames": [{"time", "ball_position", "ball_velocity",
+                       "particle_positions"?}, ...],
+          "contacts": [{"time", "object_type", "object_index", "position",
+                        "normal", "strength"}, ...],
+          "quality": {...},
+        }
+    """
+    if path.suffix.lower() == ".npz":
+        return _load_sample_npz(path)
+    return json.loads(path.read_text())
+
+
+_OBJECT_TYPE_NAMES = {
+    0: "particle",
+    1: "segment",
+    2: "segment_swept",
+    3: "goalpost",
+    4: "crossbar",
+    5: "ground_bounce",
+    6: "ground_roll",
+}
+
+
+def _load_sample_npz(path: Path) -> dict:
+    """Convert a per-sample ``.npz`` into the same dict shape that the
+    legacy JSON loader produced. The shared ``topology.json`` is found by
+    walking up from the npz file (raw/<id>.npz -> ../topology.json).
+    """
+    npz = np.load(path, allow_pickle=False)
+    meta = json.loads(npz["meta_json"].item())
+
+    # topology lives at the dataset root, one directory up from raw/.
+    dataset_root = path.parent.parent
+    topo_path = dataset_root / "topology.json"
+    if not topo_path.exists():
+        raise FileNotFoundError(
+            f"npz raw {path} requires shared topology.json at {topo_path}"
+        )
+    topology = json.loads(topo_path.read_text())
+
+    F = npz["frame_time"].shape[0]
+    times = npz["frame_time"]
+    ball_pos = npz["ball_position"]
+    ball_vel = npz["ball_velocity"]
+    particles = npz["particle_position"] if "particle_position" in npz.files else None
+
+    frames: List[dict] = []
+    for i in range(F):
+        f = {
+            "time": float(times[i]),
+            "ball_position": ball_pos[i].tolist(),
+            "ball_velocity": ball_vel[i].tolist(),
+        }
+        if particles is not None:
+            f["particle_positions"] = particles[i].tolist()
+        frames.append(f)
+
+    contacts: List[dict] = []
+    if npz["contact_time"].shape[0] > 0:
+        c_t = npz["contact_time"]
+        c_ot = npz["contact_object_type"]
+        c_oi = npz["contact_object_index"]
+        c_pos = npz["contact_position"]
+        c_nrm = npz["contact_normal"]
+        c_str = npz["contact_strength"]
+        for i in range(c_t.shape[0]):
+            contacts.append({
+                "time": float(c_t[i]),
+                "object_type": _OBJECT_TYPE_NAMES.get(int(c_ot[i]), str(int(c_ot[i]))),
+                "object_index": int(c_oi[i]),
+                "position": c_pos[i].tolist(),
+                "normal": c_nrm[i].tolist(),
+                "strength": float(c_str[i]),
+            })
+
+    return {
+        "topology": topology,
+        "shot": meta.get("shot", {}),
+        "quality": meta.get("quality", {}),
+        "stats": meta.get("stats", {}),
+        "frames": frames,
+        "contacts": contacts,
+    }
 
 
 def _contact_color(c_type: str) -> Tuple[int, int, int]:
@@ -179,7 +279,7 @@ def view_rerun(
         rr.save(save_path, recording=rec)
 
     for path in sample_paths:
-        sample = json.loads(Path(path).read_text())
+        sample = _load_sample(Path(path))
         sample_id = sample["shot"]["sample_id"]
         _log_sample(rr, sample, prefix=f"world/{sample_id}", recording=rec)
 

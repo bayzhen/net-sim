@@ -1540,7 +1540,95 @@ ssh -L 9090:localhost:9090 -L 9091:localhost:9091 user@gpu-host
 
 ---
 
-**文档版本**：v2
+## 16 · v3 高吞吐数据管线（HDF5 + simulate_arrays）
+
+### 16.1 动机
+
+v2 跑出来的 `cli.py generate --raw` 在 GTX 1650 SUPER 4 GB 上吞吐只有约 13 samples/s，看起来 GPU 利用率忽高忽低。逐个 batch 排查发现：
+
+| 瓶颈 | 实测 | 原因 |
+|---|---|---|
+| `_assemble_results` Python 循环 | ~20 s / batch=512 | 每样本每帧都构造 `FrameSample` dataclass，30 万对象 + numpy slice |
+| writer 线程持 GIL | sim 12s → 35s | JSON 编码、numpy serialize 都是 GIL-持有，阻塞主线程 launch GPU kernel |
+| 16800 个小 npz 文件 | 写盘 1.13 s/sample | 文件 syscall + 每文件独立打开关闭；HDD 写头疯狂寻道 |
+| 每 raw 内嵌 topology | 每 sample 多 ~250 KB 文本 | 250 KB × 80000 = 20 GB 重复内容 |
+
+### 16.2 三个针对性改动
+
+**(A) `simulate_arrays()` —— 跳过 B*F 对象循环**
+
+`solver_warp.py` 把 `simulate()` 拆成两层：
+- `_simulate_to_arrays()`：跑 GPU + 把所有 17 个 wp.array `.numpy()` 拉回 host，**返回 dict**（无任何 Python loop）
+- `_compute_quality_vectorized()`：把原来 per-sample 的 8 项 quality 检查全 vectorize（np.linalg.norm, .any(axis=1) 等）；只在最后构造 B 个 `QualityReport` dataclass（轻量）
+- `simulate_arrays()` = 上面两步串起来；返回值附带 `per_sample_quality` / `per_sample_stats`
+- 老 `simulate()` 入口保留，包成 `arrs → _assemble_results(arrs)` 的兼容 shim
+
+**(B) HDF5 chunked dataset —— 写盘几乎零 GIL**
+
+`output.py::make_h5_writer()`：单文件 `dataset.h5`，所有大数组 chunked + extendable：
+```python
+ds = f.create_dataset("particle_position", shape=(0, F, N, 3), maxshape=(None, F, N, 3),
+                      dtype=np.float32, chunks=(1, F, N, 3))
+# per batch:
+ds.resize((i1, F, N, 3))
+ds[i0:i1] = arrs["frame_particles"][:B]   # 一次拷贝完成；底层 h5py 释放 GIL
+```
+
+contacts 用 CSR 格式扁平存（不浪费 max_contacts × B × 6 字段的零）。topology + metadata + issue_names 进 root attrs，文件自包含。
+
+**(C) ThreadPool 异步写 + back-pressure**
+
+`cli.py`：单 worker 线程；submit 下一 batch 写盘前先 `wait()` 上一 batch 的 future，保证内存占用恒定（不会无限堆积）。配合 (A)+(B) 后，写盘耗时 ≪ sim 耗时，主线程几乎不等。
+
+### 16.3 实测对比（GTX 1650 SUPER, batch=512, --raw）
+
+| 路径 | sim batch 0 | sim batch 1+ | 写盘 | 总速率 |
+|---|---|---|---|---|
+| v2 json 写盘 | 13 s | 32 s | 113 s/100sample | 13.5 /s |
+| v2 npz 写盘 | 13 s | 31 s | 25 s/batch | 16.4 /s |
+| v3 simulate_arrays + npz | 13 s | 31 s | 22 s/batch | 23.3 /s |
+| **v3 simulate_arrays + h5** | **12 s** | **12 s** | **0.98 s 总 flush** | **42.8 /s** |
+| 上限：simulate without raw | 12 s | 12 s | – | 42.1 /s |
+
+h5 路径达到了 GPU 真正的算力上限（vs 不写盘只差 1.5%）。
+
+### 16.4 CLI
+
+```bash
+# 大数据集（推荐）
+python3 cli.py generate \
+    --count 30000 --batch 512 --device cuda \
+    --raw --incremental --raw-format h5 \
+    --seed 1 --output E:/dataset_v1
+```
+
+`--raw-format` 三档可选：
+- `h5` — 单文件 chunked HDF5，**推荐**
+- `npz` — 每样本一个 numpy 二进制；适合 < 5000 样本、要 viewer 直接看
+- `json` — 每样本一个自包含 JSON（含 topology 拷贝），仅作兼容用，不要在大数据集上开
+
+### 16.5 PyTorch dataset 加载
+
+新增 `dataset_loader.py`，封装 `dataset.h5` 为 `torch.utils.data.Dataset` 协议：
+
+```python
+from dataset_loader import GoalNetH5Dataset, GoalNetOffsetSampler
+
+base = GoalNetH5Dataset("E:/dataset_v1/dataset.h5", clean_only=True)
+ds   = GoalNetOffsetSampler(base, rng_seed=42)  # 任意偏移帧采样
+```
+
+`GoalNetOffsetSampler[i]` 返回 `(input_state[12], target_ball[3], target_ball_v[3], target_net[N,3], offset_frame)` —— 正好对应"输入球初态 + 偏移帧 t，输出 t 时刻球+网状态"的训练任务。
+
+### 16.6 已知限制 / 未做事项
+
+- HDF5 dataset 还没接 viewer——要在 rerun 里看 h5 里的某个样本，目前需要先手写 5 行 numpy → 落到 npz → `cli.py view-rerun ...`。下一个版本加 `cli.py view-rerun --h5 path/to/dataset.h5 --index N` 直接看
+- `summary.jsonl` + `features/*.json` 在 h5 模式下不再写出（h5 内同等内容覆盖了）。下游若依赖 summary.jsonl，把 h5 的 metadata 数据 dump 一份即可
+- `validate_dataset.py` 目前只验证 npz；h5 schema 自身较强、未单独写验证脚本
+
+---
+
+**文档版本**：v3
 **最后更新**：2026-05-16
-**作者**：CodeMaker AI（v1，2026-05-15）+ Claude（Warp 实现 + v2 增强，2026-05-15..16）
+**作者**：CodeMaker AI（v1，2026-05-15）+ Claude（Warp 实现 + v2 增强 + v3 数据管线，2026-05-15..16）
 

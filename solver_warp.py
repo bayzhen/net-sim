@@ -1112,6 +1112,40 @@ class XpbdWarpSolver:
     # -----------------------------------------------------------------
 
     def simulate(self, balls: List[BallState], sample_ids: List[str]) -> List[SimulationResult]:
+        """Run the full pipeline and return list-of-dataclass ``SimulationResult``.
+
+        This is the convenient API but pays for B*F Python objects when
+        record_particles=True. For high-throughput dataset writing, use
+        :meth:`simulate_arrays` instead — it skips ``_assemble_results`` and
+        returns the raw numpy arrays + vectorized per-sample quality/stats.
+        """
+        arrs = self.simulate_arrays(balls, sample_ids)
+        # _assemble_results predates the new API and doesn't know about the
+        # vectorized quality/stats; drop them before forwarding.
+        arrs = {k: v for k, v in arrs.items() if k not in ("per_sample_quality", "per_sample_stats")}
+        return self._assemble_results(**arrs)
+
+    def simulate_arrays(self, balls: List[BallState], sample_ids: List[str]) -> Dict:
+        """Same GPU work as :meth:`simulate` but returns raw numpy arrays
+        (already pulled to host) plus vectorized quality/stats. Avoids the
+        ``B * F`` python-object construction loop, which dominates wall-clock
+        when ``record_particles=True``.
+
+        Returned dict contains every key passed into ``_assemble_results`` plus:
+            ``per_sample_quality``: list[QualityReport]
+            ``per_sample_stats``:   list[StatsReport]
+        """
+        arrs = self._simulate_to_arrays(balls, sample_ids)
+        quals, stats_list = self._compute_quality_vectorized(arrs)
+        arrs["per_sample_quality"] = quals
+        arrs["per_sample_stats"] = stats_list
+        return arrs
+
+    def _simulate_to_arrays(self, balls: List[BallState], sample_ids: List[str]) -> Dict:
+        """Run the GPU simulation and pull all result arrays to host. Body is
+        the original ``simulate`` from before the refactor; it stops right
+        before ``_assemble_results``.
+        """
         B = len(balls)
         if B != self.B:
             raise ValueError(f"expected {self.B} balls, got {B}")
@@ -1579,7 +1613,7 @@ class XpbdWarpSolver:
         final_positions = self.pos_wp.numpy()
         rest_positions = self.rest_pos_wp.numpy()
 
-        return self._assemble_results(
+        return self._assemble_arrays_dict(
             sample_ids=sample_ids,
             frame_ball_pos=frame_ball_pos,
             frame_ball_vel=frame_ball_vel,
@@ -1600,9 +1634,97 @@ class XpbdWarpSolver:
             rest_positions=rest_positions,
         )
 
+    @staticmethod
+    def _assemble_arrays_dict(**k) -> Dict:
+        return dict(k)
+
     # -----------------------------------------------------------------
     # post-processing
     # -----------------------------------------------------------------
+
+    def _compute_quality_vectorized(self, k: Dict) -> Tuple[List["QualityReport"], List["StatsReport"]]:
+        """Vectorized version of the per-sample quality + stats logic in
+        ``_assemble_results``. Computes everything across the batch dim with
+        numpy ops, then constructs ``B`` lightweight dataclasses (cheap).
+        """
+        params = self.params
+        solver = params.solver
+        collision = params.collision
+        B = self.B
+        F = self.frame_count
+
+        max_pen = k["max_pen"]            # (B,)
+        max_pen_time = k["max_pen_time"]  # (B,)
+        contact_counts = k["contact_counts"]  # (B,)
+        contact_started = k["contact_started"]  # (B,)
+        stuck_time = k["stuck_time"]      # (B,)
+
+        ball_pos = k["frame_ball_pos"]    # (B, F, 3)
+        ball_vel = k["frame_ball_vel"]    # (B, F, 3)
+        final_particle_vel = k["final_particle_vel"]  # (B, N, 3)
+        final_positions = k["final_positions"]        # (B, N, 3)
+        rest_positions = k["rest_positions"]          # (N, 3) broadcast
+
+        # vector flags
+        sev_pen = max_pen > collision.severe_penetration_threshold
+        finite_pos = np.isfinite(ball_pos).reshape(B, -1).all(axis=1)
+        finite_vel = np.isfinite(ball_vel).reshape(B, -1).all(axis=1)
+        nan_or_inf = ~(finite_pos & finite_vel)
+
+        ball_speed = np.linalg.norm(ball_vel, axis=2)  # (B, F)
+        vel_explosion = (ball_speed > collision.max_ball_speed).any(axis=1)
+
+        part_speed = np.linalg.norm(final_particle_vel, axis=2)  # (B, N)
+        part_vel_explosion = (part_speed > collision.max_particle_speed).any(axis=1)
+
+        disp = np.linalg.norm(final_positions - rest_positions[None], axis=2)  # (B, N)
+        max_disp = disp.max(axis=1) if disp.size else np.zeros(B)
+        constraint_div = max_disp > collision.max_net_displacement
+
+        n_contacts_capped = np.minimum(contact_counts, self.max_contacts)
+        stuck_flag = (contact_started != 0) & (stuck_time > collision.stuck_duration)
+        target_missed = n_contacts_capped == 0
+
+        # Build dataclasses (B of each — cheap, no nested loop)
+        quals: List[QualityReport] = []
+        stats_list: List[StatsReport] = []
+        for b in range(B):
+            issues: List[str] = []
+            if sev_pen[b]:
+                issues.append("severe_penetration")
+            if nan_or_inf[b]:
+                issues.append("nan_or_inf")
+            if vel_explosion[b]:
+                issues.append("velocity_explosion")
+            if part_vel_explosion[b]:
+                issues.append("particle_velocity_explosion")
+            if constraint_div[b]:
+                issues.append("constraint_divergence")
+            if stuck_flag[b]:
+                issues.append("stuck")
+            if target_missed[b]:
+                issues.append("target_panel_missed")
+            n_c = int(n_contacts_capped[b])
+            quals.append(QualityReport(
+                clean=len(issues) == 0,
+                issues=issues,
+                target_hit=n_c > 0,
+                max_penetration_depth=max(0.0, float(max_pen[b])),
+                max_penetration_time=float(max_pen_time[b]),
+            ))
+            ball_came_to_rest = bool(ball_speed[b, -1] < 0.5)
+            stats_list.append(StatsReport(
+                frame_dt=solver.frame_dt,
+                substeps=solver.substeps,
+                iterations=solver.iterations,
+                duration=solver.duration,
+                frame_count=F,
+                contact_count=n_c,
+                max_constraint_error=float(max_disp[b]),
+                max_net_displacement=float(max_disp[b]),
+                ball_came_to_rest=ball_came_to_rest,
+            ))
+        return quals, stats_list
 
     def _assemble_results(self, **k) -> List[SimulationResult]:
         params = self.params
