@@ -72,6 +72,7 @@ class TrainConfig:
     w_ball_pos: float = 1.0
     w_ball_vel: float = 1.0
     w_net: float = 1.0
+    n_time_freq: int = 4
     preload: bool = True
     smoke: bool = False  # tiny run for sanity
 
@@ -248,23 +249,20 @@ class OffsetFrameDataset:
             else:
                 net = np.empty((self.particle_count, 3), dtype=np.float32)
 
-        # 13-D input: pos(3) + vel(3) + ang(3) + radius + mass + t_norm + 1 spare
-        input_state = np.concatenate([
-            self.input_position[si],
-            self.input_velocity[si],
-            self.input_angular[si],
-            np.array([self.input_radius[si],
-                      self.input_mass[si],
-                      t_norm,
-                      0.0], dtype=np.float32),
-        ]).astype(np.float32)
-
+        # Return raw pieces; the encoder runs on the GPU side after batching.
+        # input_position[2] is fixed at 1.5 m in the v2 dataset, so we drop
+        # it; the encoder consumes pos_xy only.
         return {
-            "input_state": input_state,
+            "pos_xy":      self.input_position[si, :2].astype(np.float32),
+            "vel":         self.input_velocity[si].astype(np.float32),
+            "ang":         self.input_angular[si].astype(np.float32),
+            "radius":      np.float32(self.input_radius[si]),
+            "mass":        np.float32(self.input_mass[si]),
+            "t_norm":      t_norm,
             "target_ball": ball_pos,
             "target_ball_v": ball_vel,
-            "target_net": net,
-            "frame": np.int64(frame),
+            "target_net":  net,
+            "frame":       np.int64(frame),
         }
 
 
@@ -298,39 +296,99 @@ def load_clean_indices(h5_path: str, clean_only: bool) -> np.ndarray:
 def collate(batch: List[Dict[str, np.ndarray]]):
     import torch
     out = {}
-    for k in ("input_state", "target_ball", "target_ball_v", "target_net"):
+    for k in ("pos_xy", "vel", "ang", "target_ball", "target_ball_v", "target_net"):
         out[k] = torch.from_numpy(np.stack([b[k] for b in batch], axis=0))
+    for k in ("radius", "mass", "t_norm"):
+        out[k] = torch.from_numpy(np.asarray([b[k] for b in batch], dtype=np.float32))
     out["frame"] = torch.from_numpy(np.stack([b["frame"] for b in batch], axis=0))
     return out
 
 
-def compute_loss(pred: dict, batch: dict, cfg: TrainConfig):
+def encode_batch_input(batch: dict, n_time_freq: int):
+    """Run the input encoder on a batched dict produced by ``collate``.
+
+    Returns the (B, in_dim) raw-units feature tensor — the model's
+    ``forward`` will normalize it internally.
+    """
+    from model import encode_input_features
+    return encode_input_features(
+        pos_xy=batch["pos_xy"],
+        vel=batch["vel"],
+        ang=batch["ang"],
+        radius=batch["radius"],
+        mass=batch["mass"],
+        t_norm=batch["t_norm"],
+        n_time_freq=n_time_freq,
+    )
+
+
+def compute_loss(model, pred_norm: dict, batch: dict, cfg: TrainConfig):
+    """Compute MSE in **standardized** space.
+
+    ``pred_norm`` is the model output with ``return_normalized=True`` so
+    each head has roughly unit variance, eliminating the scale imbalance
+    between ball and net targets.
+    """
     import torch.nn.functional as F
-    l_pos = F.mse_loss(pred["ball_pos"], batch["target_ball"])
-    l_vel = F.mse_loss(pred["ball_vel"], batch["target_ball_v"]) \
-        if "ball_vel" in pred else None
-    l_net = F.mse_loss(pred["net"], batch["target_net"])
+    tgt = model.standardize_targets(
+        batch["target_ball"],
+        batch.get("target_ball_v"),
+        batch["target_net"],
+    )
+
+    l_pos = F.mse_loss(pred_norm["ball_pos"], tgt["ball_pos"])
+    l_net = F.mse_loss(pred_norm["net"],      tgt["net"])
+    l_vel = (F.mse_loss(pred_norm["ball_vel"], tgt["ball_vel"])
+             if "ball_vel" in pred_norm and "ball_vel" in tgt else None)
+
     total = cfg.w_ball_pos * l_pos + cfg.w_net * l_net
-    parts = {"ball_pos": float(l_pos.detach()), "net": float(l_net.detach())}
+    parts = {"ball_pos": float(l_pos.detach()),
+             "net":      float(l_net.detach())}
     if l_vel is not None:
         total = total + cfg.w_ball_vel * l_vel
         parts["ball_vel"] = float(l_vel.detach())
     return total, parts
 
 
+def compute_phys_metrics(pred_phys: dict, batch: dict) -> Dict[str, float]:
+    """Compute per-head MSE in **physical units** for monitoring.
+
+    These metrics are what users care about (mean squared meters), and
+    are *not* the loss — see ``compute_loss``.
+    """
+    import torch.nn.functional as F
+    out = {
+        "ball_pos_phys": float(F.mse_loss(pred_phys["ball_pos"],
+                                          batch["target_ball"]).detach()),
+        "net_phys": float(F.mse_loss(pred_phys["net"],
+                                     batch["target_net"]).detach()),
+    }
+    if "ball_vel" in pred_phys:
+        out["ball_vel_phys"] = float(F.mse_loss(pred_phys["ball_vel"],
+                                                batch["target_ball_v"]).detach())
+    return out
+
+
 def evaluate(model, loader, device, cfg) -> Dict[str, float]:
     import torch
     model.eval()
-    sums = {"ball_pos": 0.0, "ball_vel": 0.0, "net": 0.0, "total": 0.0}
+    sums = {"ball_pos": 0.0, "ball_vel": 0.0, "net": 0.0, "total": 0.0,
+            "ball_pos_phys": 0.0, "ball_vel_phys": 0.0, "net_phys": 0.0}
     n_samples = 0
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            pred = model(batch["input_state"])
-            total, parts = compute_loss(pred, batch, cfg)
-            B = batch["input_state"].shape[0]
+            x = encode_batch_input(batch, cfg.n_time_freq)
+            pred_norm = model(x, return_normalized=True)
+            total, parts = compute_loss(model, pred_norm, batch, cfg)
+            pred_phys = model(x, return_normalized=False)
+            phys = compute_phys_metrics(pred_phys, batch)
+
+            B = x.shape[0]
             sums["total"] += float(total.detach()) * B
             for k, v in parts.items():
+                sums[k] += v * B
+            for k, v in phys.items():
                 sums[k] += v * B
             n_samples += B
     for k in sums:
@@ -341,6 +399,82 @@ def evaluate(model, loader, device, cfg) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
+
+
+def compute_norm_stats(train_ds: "OffsetFrameDataset", n_time_freq: int,
+                       max_samples_for_input: int = 8192) -> Dict[str, "torch.Tensor"]:
+    """Compute mean/std for input features and targets from the train split.
+
+    For target stats we use **all frames of all train samples** (so the
+    estimator is very tight); for input stats we just need ``n`` samples
+    × ``n_time_freq*2 + 10`` so 8192 is plenty.
+
+    Requires ``train_ds.preload == True`` so we can iterate the cached
+    arrays without re-reading HDF5.
+    """
+    import torch
+
+    if not train_ds.preload:
+        raise RuntimeError("compute_norm_stats currently requires preload=True")
+
+    n = len(train_ds)
+    F = train_ds.frame_count
+
+    # ------- input statistics (sample many random (idx, frame) pairs) -------
+    rng = np.random.default_rng(123456)
+    m = min(max_samples_for_input, n)
+    pick = rng.choice(n, size=m, replace=False)
+    frames = rng.integers(0, F, size=m, dtype=np.int64)
+
+    pos_xy = train_ds.input_position[train_ds.indices[pick], :2].astype(np.float32)
+    vel = train_ds.input_velocity[train_ds.indices[pick]].astype(np.float32)
+    ang = train_ds.input_angular[train_ds.indices[pick]].astype(np.float32)
+    rad = train_ds.input_radius[train_ds.indices[pick]].astype(np.float32)
+    mas = train_ds.input_mass[train_ds.indices[pick]].astype(np.float32)
+    tnorm = (frames.astype(np.float32) / max(F - 1, 1))
+
+    from model import encode_input_features
+    feats = encode_input_features(
+        pos_xy=torch.from_numpy(pos_xy),
+        vel=torch.from_numpy(vel),
+        ang=torch.from_numpy(ang),
+        radius=torch.from_numpy(rad),
+        mass=torch.from_numpy(mas),
+        t_norm=torch.from_numpy(tnorm),
+        n_time_freq=n_time_freq,
+    )
+    in_mean = feats.mean(0)
+    in_std = feats.std(0)
+    # Avoid std=0 on constant features (radius/mass/sin(2pi*0)=0 etc.).
+    in_std = torch.clamp(in_std, min=1e-3)
+
+    # ------- target statistics (use all frames) -------
+    bp = train_ds._ball_pos_cache.reshape(-1, 3)        # (n*F, 3)
+    bv = train_ds._ball_vel_cache.reshape(-1, 3)
+    ball_pos_mean = torch.from_numpy(bp.mean(axis=0))
+    ball_pos_std = torch.from_numpy(bp.std(axis=0))
+    ball_vel_mean = torch.from_numpy(bv.mean(axis=0))
+    ball_vel_std = torch.from_numpy(bv.std(axis=0))
+    ball_pos_std = torch.clamp(ball_pos_std, min=1e-3)
+    ball_vel_std = torch.clamp(ball_vel_std, min=1e-3)
+
+    # Per-particle mean/std: (N, 3). Computing on CPU with float32 avoids
+    # the (n*F, N, 3) reshape blowup; just reduce along axes 0,1.
+    net_cache = train_ds._net_cache  # (n, F, N, 3)
+    net_mean = torch.from_numpy(net_cache.mean(axis=(0, 1)).astype(np.float32))
+    net_std = torch.from_numpy(net_cache.std(axis=(0, 1)).astype(np.float32))
+    net_std = torch.clamp(net_std, min=1e-3)
+
+    return {
+        "in_mean": in_mean,
+        "in_std": in_std,
+        "ball_pos_mean": ball_pos_mean,
+        "ball_pos_std": ball_pos_std,
+        "ball_vel_mean": ball_vel_mean,
+        "ball_vel_std": ball_vel_std,
+        "net_mean": net_mean,
+        "net_std": net_std,
+    }
 
 
 def run_training(cfg: TrainConfig) -> Dict[str, str]:
@@ -393,7 +527,7 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
     )
 
     # --- model ---
-    from model import GoalNetMLP, count_parameters
+    from model import GoalNetMLP, count_parameters, input_dim_for
     if cfg.device == "cuda" and not torch.cuda.is_available():
         print("[warn] --device cuda requested but torch.cuda.is_available() is "
               "False; falling back to CPU. Reinstall PyTorch with CUDA support "
@@ -403,8 +537,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
         device = torch.device("cpu")
     else:
         device = torch.device(cfg.device)
+
+    in_dim = input_dim_for(cfg.n_time_freq)
     model = GoalNetMLP(
-        in_dim=13,
+        in_dim=in_dim,
         n_particles=train_ds.particle_count,
         hidden=tuple(cfg.hidden),
         activation=cfg.activation,
@@ -412,8 +548,18 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
         dropout=cfg.dropout,
     ).to(device)
     print(f"model: GoalNetMLP, params={count_parameters(model):,}, "
-          f"device={device}, N={train_ds.particle_count}, F={train_ds.frame_count}",
+          f"in_dim={in_dim}, device={device}, "
+          f"N={train_ds.particle_count}, F={train_ds.frame_count}",
           flush=True)
+
+    # Compute and install normalization statistics from the train split.
+    print("computing normalization statistics from train split...", flush=True)
+    t_stats0 = time.time()
+    stats = compute_norm_stats(train_ds, cfg.n_time_freq)
+    model.set_norm_stats({k: v.to(device) for k, v in stats.items()})
+    print(f"  done in {time.time()-t_stats0:.1f}s "
+          f"(ball_pos_std={stats['ball_pos_std'].tolist()}, "
+          f"net_std mean={stats['net_std'].mean().item():.4f})", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                   weight_decay=cfg.weight_decay)
@@ -448,12 +594,14 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
 
         model.train()
         epoch_t0 = time.time()
-        running = {"ball_pos": 0.0, "ball_vel": 0.0, "net": 0.0, "total": 0.0}
+        running = {"ball_pos": 0.0, "ball_vel": 0.0, "net": 0.0, "total": 0.0,
+                   "ball_pos_phys": 0.0, "ball_vel_phys": 0.0, "net_phys": 0.0}
         n_seen = 0
         for step, batch in enumerate(train_loader):
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-            pred = model(batch["input_state"])
-            total, parts = compute_loss(pred, batch, cfg)
+            x = encode_batch_input(batch, cfg.n_time_freq)
+            pred_norm = model(x, return_normalized=True)
+            total, parts = compute_loss(model, pred_norm, batch, cfg)
             optimizer.zero_grad(set_to_none=True)
             total.backward()
             if cfg.grad_clip > 0:
@@ -461,9 +609,16 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
             optimizer.step()
             scheduler.step()
 
-            B = batch["input_state"].shape[0]
+            # Bookkeeping in physical units (cheap; uses the same forward).
+            with torch.no_grad():
+                pred_phys = model(x, return_normalized=False)
+                phys = compute_phys_metrics(pred_phys, batch)
+
+            B = x.shape[0]
             running["total"] += float(total.detach()) * B
             for k, v in parts.items():
+                running[k] += v * B
+            for k, v in phys.items():
                 running[k] += v * B
             n_seen += B
             global_step += 1
@@ -472,9 +627,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
                 avg = {k: v / max(n_seen, 1) for k, v in running.items()}
                 lr = scheduler.get_last_lr()[0]
                 print(f"  ep {epoch:03d} step {step+1:05d} "
-                      f"loss={avg['total']:.4e} pos={avg['ball_pos']:.4e} "
-                      f"vel={avg.get('ball_vel', 0):.4e} net={avg['net']:.4e} "
-                      f"lr={lr:.2e}", flush=True)
+                      f"loss={avg['total']:.4e}  norm[pos={avg['ball_pos']:.3e} "
+                      f"vel={avg.get('ball_vel', 0):.3e} net={avg['net']:.3e}]  "
+                      f"phys[pos={avg['ball_pos_phys']:.3f} "
+                      f"vel={avg.get('ball_vel_phys', 0):.3f} "
+                      f"net={avg['net_phys']:.3f}]  lr={lr:.2e}", flush=True)
 
         train_loss = {k: v / max(n_seen, 1) for k, v in running.items()}
         val_loss = evaluate(model, val_loader, device, cfg)
@@ -482,9 +639,11 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
         elapsed = time.time() - t_start
         eta = elapsed / max(epoch + 1, 1) * (cfg.epochs - epoch - 1)
         print(f"epoch {epoch:03d} done in {epoch_dt:.1f}s  "
-              f"train={train_loss['total']:.4e} val={val_loss['total']:.4e} "
-              f"(pos={val_loss['ball_pos']:.4e} vel={val_loss['ball_vel']:.4e} "
-              f"net={val_loss['net']:.4e})  ETA={eta/60:.1f}min", flush=True)
+              f"train_norm={train_loss['total']:.4e} "
+              f"val_norm={val_loss['total']:.4e}  "
+              f"phys[pos={val_loss['ball_pos_phys']:.3f} "
+              f"vel={val_loss['ball_vel_phys']:.3f} "
+              f"net={val_loss['net_phys']:.4f}]  ETA={eta/60:.1f}min", flush=True)
 
         rec = {
             "epoch": epoch,
@@ -516,9 +675,10 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
     state = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state"])
     test_loss = evaluate(model, test_loader, device, cfg)
-    print(f"test: total={test_loss['total']:.4e} "
-          f"pos={test_loss['ball_pos']:.4e} vel={test_loss['ball_vel']:.4e} "
-          f"net={test_loss['net']:.4e}", flush=True)
+    print(f"test: norm_total={test_loss['total']:.4e}  "
+          f"phys[pos={test_loss['ball_pos_phys']:.3f} "
+          f"vel={test_loss['ball_vel_phys']:.3f} "
+          f"net={test_loss['net_phys']:.4f}]", flush=True)
     (out / "test_metrics.json").write_text(json.dumps(test_loss, indent=2))
 
     train_ds.close(); val_ds.close(); test_ds.close()
@@ -540,11 +700,15 @@ def run_training(cfg: TrainConfig) -> Dict[str, str]:
 def add_train_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dataset", required=True, help="path to dataset.h5")
     p.add_argument("--output", required=True, help="output directory for checkpoints/logs")
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch", dest="batch_size", type=int, default=256)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch", dest="batch_size", type=int, default=512)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", dest="weight_decay", type=float, default=1e-5)
-    p.add_argument("--hidden", type=int, nargs="+", default=[512, 512, 512, 512])
+    p.add_argument("--hidden", type=int, nargs="+",
+                   default=[1024, 1024, 1024, 1024, 1024, 1024])
+    p.add_argument("--n-time-freq", dest="n_time_freq", type=int, default=4,
+                   help="number of sinusoidal time-embedding frequencies "
+                   "(input_dim = 10 + 2*n)")
     p.add_argument("--activation", choices=["relu", "gelu", "silu"], default="gelu")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
@@ -594,6 +758,7 @@ def cfg_from_args(args: argparse.Namespace) -> TrainConfig:
         w_ball_pos=args.w_ball_pos,
         w_ball_vel=args.w_ball_vel,
         w_net=args.w_net,
+        n_time_freq=args.n_time_freq,
         preload=args.preload,
         smoke=args.smoke,
     )
