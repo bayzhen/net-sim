@@ -1,0 +1,13 @@
+# Core simulation + dataset pipeline
+warp-lang
+numpy
+h5py
+
+# Training (CUDA build of torch is recommended; install separately
+# from the PyTorch index, e.g.
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# for CUDA 12.1, or cu124 / cu118 to match your CUDA driver).
+torch
+
+# Optional viewer
+rerun-sdk
