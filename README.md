@@ -2,7 +2,7 @@
 
 足球射门 → XPBD 球网响应模拟器，输出 teacher 数据集用于训练 neural goal-net response model。
 
-完整设计文档：[`goal_net_warp_design.md`](goal_net_warp_design.md)（14 节，覆盖物理模型、参数表、算法、Warp 实现指南、bug 列表、验收标准）。
+完整设计文档：[`goal_net_warp_design.md`](goal_net_warp_design.md)（17 节，覆盖物理模型、参数表、算法、Warp 实现指南、数据管线、训练管线 v1/v2、bug 列表、验收标准）。
 
 ---
 
@@ -27,15 +27,22 @@
 - **GPU**：测试在 GTX 1650 SUPER 4 GB（batch=512 + raw 仍能跑）。8 GB 卡上 batch 可拉到 ≥ 4096
 
 ```bash
-pip install --user warp-lang numpy h5py
+# 数据生成 + 可视化
+pip install --user warp-lang numpy h5py psutil
 pip install --user rerun-sdk    # 可选，仅 view-rerun 子命令需要
+
+# 训练管线（PyTorch CUDA build；驱动 12.x 用 cu121）
+pip install --user torch --index-url https://download.pytorch.org/whl/cu121
 ```
 
 > `h5py` 是 v3 之后必需，用于 `--raw-format h5` 的高吞吐数据集格式。
+> `psutil` 是 v4 之后训练管线的安全检查依赖（preload 前判断 RAM 够不够）。
+> `requirements.txt` 已就位，`pip install -r requirements.txt` 一行即可（注意 torch 仍需手动指定 CUDA index）。
 
 验证：
 ```bash
 python3 -c "import warp as wp; wp.init(); print(wp.get_devices())"
+python3 -c "import torch; print('torch', torch.__version__, 'cuda:', torch.cuda.is_available())"
 ```
 
 ---
@@ -137,6 +144,73 @@ python3 cli.py --params my_params.json topology
 ⚠️ rerun 0.32 把 web viewer 拆成两个端口：**HTTP UI 在 PORT，gRPC 数据在 PORT+1**。SSH tunnel / 防火墙 / Docker 端口映射必须把两个一起开。
 
 每个 raw 样本写入一个独立的 `RecordingStream`（recording_id = sample_id），viewer 左上角"Recordings"列表可切换样本。所有 entity 都声明 `RIGHT_HAND_Y_UP` 视图坐标——避免 rerun 默认 Z-up 把场景画歪。
+
+### `train` —— 训练 MLP 代理模型
+
+在 `--raw-format h5` 产出的 `dataset.h5` 上训练一个神经代理：输入 `(球初态 + 归一化时间 t_norm)`，输出 `(球位置, 球速度, 网粒子位置)`。
+
+```bash
+python3 cli.py train \
+    --dataset /data3/netsim/dataset_v2/dataset.h5 \
+    --output runs/mlp_v2 \
+    --epochs 100 --batch 4096 --device cuda \
+    --hidden 1024 1024 1024 1024 1024 1024
+```
+
+| flag | 默认 | 含义 |
+|---|---|---|
+| `--dataset` | (必填) | `dataset.h5` 路径 |
+| `--output` | (必填) | 训练产物目录 |
+| `--epochs` | 100 | 训练轮数 |
+| `--batch` | 512 | mini-batch 大小（对 RTX 4090 推荐 4096） |
+| `--lr` | 3e-4 | AdamW 学习率（cosine 退火） |
+| `--hidden 1024 1024 ...` | `[1024]*6` | MLP 各隐藏层宽度 |
+| `--n-time-freq` | 4 | sin/cos 时间编码频率数；in_dim = 10 + 2·N |
+| `--no-preload` | preload | 关闭 RAM 预加载，回退到 HDF5 流式读（慢 ~280×，用于 RAM 紧张机器） |
+| `--preload-test` | off | 也预加载 test 集（默认 test 流式读，因为只在最后跑一次） |
+| `--w-ball-pos / --w-ball-vel / --w-net` | 1.0 | 各 head loss 权重（归一化空间） |
+| `--num-workers` | 0 | DataLoader worker（preload 模式下强制 0） |
+
+**性能要点**：默认 `--preload` 会一次性把 train+val 的 `(B, F, N, 3)` 全部读进 RAM（~50 GB for 14k clean × 601 帧 × 514 粒子）。读取完后 epoch 仅 ~0.1 s（GPU 拉满）。
+- 启动前 `psutil` 会做 1.4× 安全裕度检查，装不下时给清晰错误信息。
+- 大数据集装不下时用 `--no-preload`（慢，但任何机器都能跑）。
+
+**产物**（`--output` 目录）：
+```
+config.json         # 完整超参 + 数据集统计
+metrics.jsonl       # 每 epoch 的 train/val loss（含归一化和物理单位两套）
+best.pt             # val loss 最低的 checkpoint（含归一化 buffer）
+last.pt             # 最后 epoch checkpoint
+test_metrics.json   # best.pt 在 test split 上的 RMSE
+```
+
+> 详细技术决策（归一化策略、模型结构、已知 baseline 缺陷与修复路径）见设计文档 §17。
+
+### `predict` —— 评估 / 诊断 checkpoint
+
+跑完训练后用 `predict` 在 test split 上做**全帧**评估（与训练时"每样本随机抽 1 帧"不同），输出 per-frame RMSE 曲线和 worst-K 最差样本，方便定位模型在哪一帧 / 哪类样本上崩。
+
+```bash
+python3 cli.py predict \
+    --ckpt runs/mlp_v2/best.pt \
+    --dataset /data3/netsim/dataset_v2/dataset.h5 \
+    --output runs/mlp_v2/eval \
+    --device cuda --batch 16 --worst-k 16
+```
+
+| flag | 默认 | 含义 |
+|---|---|---|
+| `--ckpt` | (必填) | `best.pt` / `last.pt` |
+| `--dataset` | (必填) | 同训练用的 h5（splits 由 ckpt 内的 seed 复现） |
+| `--output` | (必填) | 评估产物目录 |
+| `--batch` | 8 | 每次前向多少个完整样本（每样本贡献 F 帧） |
+| `--worst-k` | 16 | 输出多少个最差样本 |
+
+**产物**：
+- `per_frame_rmse.json` — `(F,)` RMSE 曲线（球位置/速度/网）
+- `per_sample_summary.json` — 每个 test 样本的时均 RMSE
+- `worst_k.json` — 按球位置 RMSE 排序的最差 K 个样本
+- `summary.json` — 整体 mean/median/p95
 
 ---
 

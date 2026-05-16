@@ -1628,7 +1628,223 @@ ds   = GoalNetOffsetSampler(base, rng_seed=42)  # 任意偏移帧采样
 
 ---
 
-**文档版本**：v3
+## 17 · v4 训练管线（MLP 代理模型 v1 + v2 baseline）
+
+### 17.1 目标与范围
+
+在 v3 数据集（`dataset.h5`）上训练一个**离线代理模型**（surrogate），输入 `(球初态 + 归一化时间 t_norm)`，输出 `(球位置, 球速度, 网粒子位置)`。本节覆盖 v1（裸 MLP，1.6 M 参数）和 v2（加归一化 + 时间正弦编码 + 6.85 M 参数）两次迭代，以及随之暴露的 baseline 缺陷。
+
+代码：`model.py`、`train.py`、`predict.py`，CLI 入口 `cli.py train` / `cli.py predict`。
+
+### 17.2 第一次迭代（v1，2026-05-16 上午）
+
+**模型**：`GoalNetMLP` 13-D in（pos[3] + vel[3] + ang[3] + radius + mass + t_norm + spare）→ hidden=[512]*4 → ball_pos(3) + ball_vel(3) + net(N*3)，~1.6 M 参数，无归一化。
+
+**训练管线**：
+- `OffsetFrameDataset`：HDF5 流式读取，`__getitem__` 为每个样本随机抽一帧。
+- AdamW + CosineAnnealingLR，loss = MSE(pos) + MSE(vel) + MSE(net) 等权。
+- 90/5/5 split，`clean_only=True`。
+
+**关键 bug 修复**：
+- `output.py::append_chunk_arrays` padding 越界 IndexError（最后一个 batch 不满 `batch_size` 时崩；solver pad 到 batch_size 后 `quals` 长度仍是 batch_size，循环走出 issue_mask 边界）。修复：`quals = list(arrs["per_sample_quality"])[:B]`。
+- 远端 RTX 4090 装 CUDA torch（`pip install torch --index-url https://download.pytorch.org/whl/cu121`），本地 GTX 1650 SUPER 装 cu121 wheel。
+- HDF5 fancy indexing 要求升序，`predict.py` 里改成 sort + unscramble。
+
+**性能（GTX 1650 SUPER）**：87 s/epoch（GPU 利用率 0%），后来 → RTX 4090 上 28 s/epoch（GPU 仍 0%）。**bottleneck = HDF5 单帧读 I/O**（每 epoch 51 GB），加 `num_workers=4` 也只能小幅缓解。
+
+**预加载优化**（`--preload`，默认开）：
+- 一次性把 train/val 的 `(B, F, 3) ball_position/velocity` 和 `(B, F, N, 3) particle_position` 读进 RAM。
+- train split 占 ~50 GB，val 占 2.8 GB；test 默认仍流式读（仅最终评估 1 次）。
+- `__getitem__` 变成纯 numpy 索引；epoch 时间从 28 s → **0.1 s（280× 加速）**。
+- 在 `_preload_arrays` 里加 `psutil.virtual_memory()` 1.4× 安全裕度检查，装不下时报错而非 OOM-Kill。
+
+**v1 测试集结果**（30 epoch，batch=4096，hidden=[512]*4，无归一化）：
+
+| 指标 | RMSE | 评价 |
+|---|---:|---|
+| ball_pos | 3.22 m | 极差（球门只 ~7 m 宽） |
+| ball_vel | 2.10 m/s | 一般 |
+| net | 27 cm | 较差（粒子位置 std 仅 ~0.7 m） |
+
+诊断：模型几乎"输出常数 = ball_pos 均值",MSE 卡在球本身的方差上。原因：未做归一化，球 / 网两路输出尺度差异大（5.6 m vs 0.84 m），模型偏向预测大尺度通道的均值以快速降低 loss。
+
+### 17.3 第二次迭代（v2，2026-05-16 下午）
+
+**改动 1：去掉常量输入维度**
+统计揭示 `input_position[2]=1.5`、`input_radius=0.130`、`input_mass=1.0` 在 v2 数据集中**全部是常量**，模型 13-D 输入实际只有 ~10 维有效信号。
+
+**改动 2：`encode_input_features` 替代裸 13-D**
+```
+input_dim = 2 (pos_xy) + 3 (vel) + 3 (ang) + 1 (radius) + 1 (mass) + 2*n_time_freq
+          = 10 + 2 * n_time_freq      # 默认 n_time_freq=4 → 18-D
+```
+- 丢弃 `pos_z`（常量）；保留 radius/mass 以兼容未来变球数据集。
+- t_norm 用 sin/cos 多频编码（默认 4 频率，对应 0.6/0.3/0.15/0.075 s 的周期），让 MLP 对时间维度敏感。
+
+**改动 3：模型内置归一化 buffer**
+`GoalNetMLP` 注册不可训练 buffer（in_mean / in_std / ball_pos_mean / ball_pos_std / ball_vel_* / net_*），从 train split 上一次性算好。
+- `forward(x, return_normalized=True)` 在标准化空间返回，loss 在标准化空间计算（强制各 head 等权）。
+- `forward(x, return_normalized=False)` 反归一化到物理单位。
+- checkpoint 保存全部统计量，推理零外部依赖。
+
+**改动 4：`compute_norm_stats(train_ds)` 用流式累加**
+```python
+# 反例（OOM-killed）
+net_mean = net_cache.mean(axis=(0, 1))   # numpy 临时分配 50 GB 中间数组
+net_std  = net_cache.std (axis=(0, 1))   # 又 50 GB；总 156 GB > 125 GB RAM ✗
+
+# 正例（流式）
+sum_net   = np.zeros((N, 3), float64)
+sumsq_net = np.zeros((N, 3), float64)
+for i in range(n):
+    net = net_cache[i]                    # (F, N, 3) view，~3.5 MB
+    sum_net   += net.astype(np.float64).sum(axis=0)
+    sumsq_net += (net.astype(np.float64) ** 2).sum(axis=0)
+# variance = E[x^2] - E[x]^2
+```
+峰值临时仅 ~14 MB，12 秒处理 876 万帧。
+
+**改动 5：模型容量**
+hidden=[1024]*6（GELU），~6.85 M 参数，epoch=100。
+
+**v2 测试集结果**（100 epoch，batch=4096，preload=True，dataset_v2 16198 clean）：
+
+| 指标 | RMSE | vs v1 |
+|---|---:|---:|
+| ball_pos | 2.79 m | -13% |
+| ball_vel | 1.07 m/s | -49% |
+| net | 0.94 cm | **-97%** |
+
+`net` 误差从 27 cm → 0.94 cm，决定性进步——但 `ball_pos` 仍然 2.8 m 量级，球门 ~7 m 宽，**1/3 球门宽度的预测误差不能用**。
+
+### 17.4 v2 baseline 的根因诊断（关键发现）
+
+`predict.py` 输出的 per-frame RMSE 暴露了核心问题：
+
+```
+f=  0  t=0.000s   ball_pos=1.71 m   ball_vel=7.59 m/s   net=11.7 mm
+f= 30  t=0.500s   ball_pos=0.98 m   ball_vel=2.07 m/s   net=12.5 mm
+f=120  t=2.000s   ball_pos=2.36 m   ball_vel=1.07 m/s   net= 9.2 mm
+f=240  t=4.000s   ball_pos=3.01 m   ball_vel=0.15 m/s   net= 9.2 mm  ← 已"静止"但还差 3 m
+f=600  t=10.000s  ball_pos=4.12 m   ball_vel=7.89 m/s   net=12.8 mm  ← 边界 artifact
+```
+
+**问题 1：t=0 即出错**。模型输入里直接含 `pos_xy` 和 `vel`，t=0 应该可平凡复现，但 v2 模型 ball_pos err 1.71 m、ball_vel err **7.59 m/s** —— 模型连恒等映射都没学会。`scripts/sanity_f0.py` 一一对齐每个样本：
+```
+input_velocity = [-25.04,  7.16, -9.98]   ← 真值
+ball_vel[f=0]  = [-25.04,  7.16, -9.98]   ← 等于输入
+pred_vel       = [-11.94,  2.53, -3.50]   ← 模型预测，幅值仅真值的 ~50%
+```
+**8 个样本全部呈现"预测幅值 = 真值的 30-50%"** —— 经典的 regression-to-mean。
+
+**问题 2：归一化统计量 leak**。统计是基于"全 601 帧 × 全样本"算的：
+- `ball_vel_std = [2.94, 1.40, 1.91]`  ← 大部分帧球已停止，std 被压低
+- 但 `input_velocity_std = [18.9, 5.2, 6.1]` ← 真实初始速度方差比这大 ~7×
+
+模型把"真值 25 m/s"看成"标准化空间 25/2.94 = 8.5 sigma"——MSE loss 对 8.5 sigma 输出的梯度极大，但 ReLU/GELU 网络很难产生 8.5 sigma 输出，于是模型选择"输出 ~1 sigma 中庸值"作为局部最优。
+
+**问题 3：边界 artifact**。f=600 是数据集最后一帧，sin/cos 时间编码在 t=1.0 处行为奇异（cos(2π·1)=1=cos(0)），加上训练时随机抽帧但 f=600 抽到的概率与其他帧相同——网络没有特殊处理"endgame"。
+
+**问题 4：球轨迹本质难度**。10 秒内的 (vel, pos_xy, ang) → (3D 抛物线 + 撞网 + 反弹 + 滚动) 是分段非线性映射，纯 MLP 不友好。即使修好归一化，6.85 M 参数的 MLP 能否拟合到 RMSE < 30 cm 仍是开放问题。
+
+### 17.5 完整训练命令（远端 RTX 4090）
+
+```bash
+ssh netease@10.224.118.94
+cd /data3/netsim/net-sim && source .venv/bin/activate
+
+# 数据生成（已完成；如需重做）
+python -u cli.py generate \
+    --count 30000 --batch 1024 --device cuda \
+    --raw --incremental --raw-format h5 \
+    --seed 1 --output /data3/netsim/dataset_v2 \
+    > /data3/netsim/dataset_v2.log 2>&1 &
+
+# 训练（v2 baseline）
+python -u cli.py train \
+    --dataset /data3/netsim/dataset_v2/dataset.h5 \
+    --output /data3/netsim/runs/mlp_v2 \
+    --epochs 100 --batch 4096 --device cuda \
+    --hidden 1024 1024 1024 1024 1024 1024 \
+    --log-every 5 \
+    > /data3/netsim/runs/mlp_v2.log 2>&1 &
+
+# 评估
+python -u cli.py predict \
+    --ckpt /data3/netsim/runs/mlp_v2/best.pt \
+    --dataset /data3/netsim/dataset_v2/dataset.h5 \
+    --output /data3/netsim/runs/mlp_v2/eval \
+    --device cuda --batch 16 --worst-k 16
+```
+
+实测时间：generate 235 s · train 100 epoch ~13 s + preload 60 s · predict ~60 s。
+
+### 17.6 已知问题与下一步（v3 候选）
+
+按优先级排序，每个都是独立可尝试的改动：
+
+**(A) 修复归一化 stats leak（必做）**
+- 选项 A1：`ball_pos_std / ball_vel_std` 改用 `input_position.std(axis=0)` / `input_velocity.std(axis=0)`（即只用 frame-0 的统计），保留 net 的全帧统计。
+- 选项 A2：用 1-99 分位数距离作为 robust scale。
+- 选项 A3：完全去掉输出归一化，用手动 loss 权重 `loss = pos_mse / 100 + vel_mse / 5 + net_mse * 100` 重新调（但需要超参数搜索）。
+
+**(B) 重新设计预测目标 = "delta vs 抛物线 baseline"（中期）**
+不让模型预测绝对位置，而预测 `target - baseline_position`，其中 baseline 是无重力/有重力/无碰撞的解析抛物线。这把模型的工作压缩到"撞网/反弹修正",数值范围一下子从 [-30, 30] m 降到 [-2, 2] m，而且 t=0 自然回到 baseline。
+
+**(C) 边界帧处理**
+- 训练时丢弃最后 5 帧（边界 artifact 对模型有害无益），或加 `t_norm = clip(t_norm, 0, 0.99)`。
+- 在 t_norm sin/cos embedding 之外加一个 `is_settled` 指示位（球速度 < 阈值时为 1）。
+
+**(D) 模型容量 / 结构（看修完归一化后是否还需要）**
+- hidden=[2048]*8 → ~25 M 参数。
+- 或者换 transformer-like：把 N=514 个粒子作为 token 序列。
+
+**(E) 验证/可视化**
+`predict.py` 已能输出 per_frame_rmse 曲线和 worst_k 列表。下一步加 rerun 双轨可视化（GT vs Pred 同一 entity tree 的 `/gt` `/pred` 路径），或者加 matplotlib 画 RMSE-vs-frame 折线图作 png。
+
+**(F) 数据集多样性**
+当前 30000 样本里 input_radius、input_mass 完全固定为常量。若后续要训"对各种球普适"的代理，需要扩展 `sampler.py` 让这两个采样有方差。
+
+### 17.7 当前已经工作的部分
+
+- ✅ `cli.py generate` 在 RTX 4090 上 130 sample/s，30000 样本 4 分钟
+- ✅ `cli.py train --preload` 在 RTX 4090 上 0.1 s/epoch，100 epoch + 60s preload + 12s stats < 2 分钟
+- ✅ `cli.py predict` 全 test 帧评估 + worst-K 排名 + per-frame RMSE 曲线 ~60 s
+- ✅ checkpoint 自包含归一化 stats，可直接 reload 推理
+- ✅ OOM 安全检查（preload 前 `psutil` 1.4× 裕度）
+- ✅ 修复 padding batch 的 IndexError（`output.py`）
+
+### 17.8 远端工作目录布局
+
+```
+/data3/netsim/
+├── dataset_v2/                    # 105 GB，30000 样本 16198 clean
+│   ├── dataset.h5
+│   ├── topology.json
+│   ├── metadata.json
+│   └── batch_report.json
+├── dataset_v2.log
+├── net-sim/                       # git clone
+│   ├── .venv/                     # python3.10 venv with cu121 torch
+│   └── …
+└── runs/
+    ├── mlp_v1_pilot/              # v1 5-epoch 预热（h5 streaming）
+    ├── mlp_v1/                    # v1 30-epoch（h5 streaming）
+    ├── mlp_v2/                    # v2 baseline（preload + norm）★
+    │   ├── best.pt  last.pt  config.json
+    │   ├── metrics.jsonl  test_metrics.json
+    │   └── eval/                  # predict.py 输出
+    │       ├── per_frame_rmse.json
+    │       ├── per_sample_summary.json
+    │       ├── worst_k.json
+    │       └── summary.json
+    ├── mlp_v1_pilot.log  mlp_v1.log  mlp_v2.log
+    └── …
+```
+
+---
+
+**文档版本**：v4
 **最后更新**：2026-05-16
-**作者**：CodeMaker AI（v1，2026-05-15）+ Claude（Warp 实现 + v2 增强 + v3 数据管线，2026-05-15..16）
+**作者**：CodeMaker AI（v1，2026-05-15）+ Claude（Warp 实现 + v2 增强 + v3 数据管线 + v4 训练管线，2026-05-15..16）
 
