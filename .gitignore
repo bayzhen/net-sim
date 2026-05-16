@@ -6,6 +6,7 @@ __pycache__/
 # Generated datasets & rerun recordings
 Agent/Temp/
 *.rrd
+tmp_*/
 
 # Editor / OS noise
 .vscode/
