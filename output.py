@@ -1046,8 +1046,10 @@ def make_h5_writer(
         f["input_radius"][i0:i1] = np.array([s.ball.radius for s in shots], dtype=np.float32)
         f["input_mass"][i0:i1] = np.array([s.ball.mass for s in shots], dtype=np.float32)
 
-        quals: List[QualityReport] = arrs["per_sample_quality"]
-        stats_list: List[StatsReport] = arrs["per_sample_stats"]
+        # Solver may pad the chunk up to ``batch_size`` for GPU efficiency;
+        # truncate per-sample lists so we only persist the real samples.
+        quals: List[QualityReport] = list(arrs["per_sample_quality"])[:B]
+        stats_list: List[StatsReport] = list(arrs["per_sample_stats"])[:B]
         clean_arr = np.fromiter((q.clean for q in quals), dtype=np.bool_, count=B)
         target_hit_arr = np.fromiter((q.target_hit for q in quals), dtype=np.bool_, count=B)
         max_pen_arr = np.fromiter((q.max_penetration_depth for q in quals), dtype=np.float32, count=B)

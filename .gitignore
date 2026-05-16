@@ -15,6 +15,10 @@ smoke_*/
 dataset_v*.log
 *.h5
 
+# Training runs (checkpoints / metrics / logs)
+runs/
+*.pt
+
 # Editor / OS noise
 .vscode/
 .idea/

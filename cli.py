@@ -4,6 +4,7 @@ Subcommands:
     topology       — print topology summary for current params
     generate       — run sampler + warp solver + write outputs
     view-rerun     — open one or more raw samples in rerun (web or save)
+    train          — train the MLP surrogate on a generated HDF5 dataset
 """
 from __future__ import annotations
 
@@ -264,6 +265,17 @@ def cmd_view_rerun(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_train(args: argparse.Namespace) -> int:
+    from train import cfg_from_args, run_training
+
+    cfg = cfg_from_args(args)
+    paths = run_training(cfg)
+    print("wrote:")
+    for k, v in paths.items():
+        print(f"  {k}: {v}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="goal_net_xpbd")
     parser.add_argument("--params", help="JSON file overriding default params")
@@ -314,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_view.add_argument("--save", help="path to write .rrd")
     p_view.set_defaults(func=cmd_view_rerun)
+
+    p_train = sub.add_parser("train", help="train MLP surrogate on a dataset.h5")
+    from train import add_train_args
+    add_train_args(p_train)
+    p_train.set_defaults(func=cmd_train)
     return parser
 
 
