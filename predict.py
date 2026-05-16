@@ -149,20 +149,32 @@ def evaluate_per_frame(
         s_chunk = test_idx[s_start:s_end]            # (B,)
         B = int(s_chunk.size)
 
+        # h5py fancy indexing requires monotonically increasing indices.
+        # Read in sorted order, then unscramble back to s_chunk order.
+        order = np.argsort(s_chunk)
+        inv = np.empty_like(order)
+        inv[order] = np.arange(B)
+        s_sorted = s_chunk[order]
+
+        def _read(name: str) -> np.ndarray:
+            arr = f[name][s_sorted]
+            return arr[inv]
+
         # Read this chunk of samples — small (B,) arrays then big slabs.
-        pos_xy = f["input_position"][s_chunk, :2].astype(np.float32)   # (B, 2)
-        vel = f["input_velocity"][s_chunk].astype(np.float32)
-        ang = f["input_angular"][s_chunk].astype(np.float32)
-        rad = f["input_radius"][s_chunk].astype(np.float32)
-        mas = f["input_mass"][s_chunk].astype(np.float32)
+        pos_xy = _read("input_position")[:, :2].astype(np.float32)   # (B, 2)
+        vel = _read("input_velocity").astype(np.float32)
+        ang = _read("input_angular").astype(np.float32)
+        rad = _read("input_radius").astype(np.float32)
+        mas = _read("input_mass").astype(np.float32)
+        sample_ids_raw = _read("sample_id")
         sample_ids = [bytes(x).decode("utf-8", errors="replace")
                       if isinstance(x, (bytes, np.bytes_))
-                      else str(x) for x in f["sample_id"][s_chunk]]
+                      else str(x) for x in sample_ids_raw]
 
         # Big targets: (B, F, 3), (B, F, 3), (B, F, N, 3)
-        bp_tgt = f["ball_position"][s_chunk]
-        bv_tgt = f["ball_velocity"][s_chunk]
-        net_tgt = f["particle_position"][s_chunk]
+        bp_tgt = _read("ball_position")
+        bv_tgt = _read("ball_velocity")
+        net_tgt = _read("particle_position")
 
         # Build (B*F, ...) input batch.
         pos_xy_t = torch.from_numpy(pos_xy).to(device)
